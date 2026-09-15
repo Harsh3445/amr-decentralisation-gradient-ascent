@@ -1,0 +1,78 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+uint8_t peerAddress[] = {
+  0x20, 0x9B, 0xA9, 0x60, 0xE3, 0xF4
+};
+
+typedef struct {
+  char message[200];
+} Message;
+
+Message incomingData;
+esp_now_peer_info_t peerInfo;
+
+void OnDataRecv(const esp_now_recv_info_t *info,
+                const uint8_t *incomingDataBytes,
+                int len) {
+
+  memcpy(&incomingData, incomingDataBytes, sizeof(incomingData));
+
+  Serial.println();
+  Serial.println("========== MESSAGE RECEIVED ==========");
+  Serial.print("From: ESP32 A");
+  Serial.println();
+  Serial.print("Message: ");
+  Serial.println(incomingData.message);
+  Serial.println("======================================");
+}
+
+void OnDataSent(const wifi_tx_info_t *tx_info,
+                esp_now_send_status_t status) {
+
+  Serial.print("Reply status: ");
+
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    Serial.println("Delivery Success");
+  } else {
+    Serial.println("Delivery Fail");
+  }
+}
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(1000);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setChannel(1);
+
+  Serial.println();
+  Serial.println("ESP32 B - RECEIVER");
+
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW initialization failed!");
+    return;
+  }
+
+  esp_now_register_recv_cb(OnDataRecv);
+  esp_now_register_send_cb(OnDataSent);
+
+  memcpy(peerInfo.peer_addr, peerAddress, 6);
+  peerInfo.channel = 1;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add ESP32 A as peer");
+    return;
+  }
+
+  Serial.println("ESP32 B is ready.");
+  Serial.println("Waiting for messages...");
+}
+
+void loop() {
+}
