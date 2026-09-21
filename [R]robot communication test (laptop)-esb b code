@@ -1,0 +1,157 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+#define IN1 27
+#define IN2 26
+#define IN3 25
+#define IN4 33
+
+typedef struct {
+  char command;
+} RobotCommand;
+
+RobotCommand incomingData;
+
+void OnDataRecv(const esp_now_recv_info_t *info,
+                const uint8_t *data,
+                int len) {
+
+  if (len != sizeof(RobotCommand)) {
+    return;
+  }
+
+  memcpy(&incomingData, data, sizeof(incomingData));
+
+  char command = incomingData.command;
+
+  Serial.print("[RECEIVED] ");
+  Serial.println(command);
+
+  if (command == 'F') {
+    forward();
+  }
+
+  else if (command == 'B') {
+    backward();
+  }
+
+  else if (command == 'L') {
+    left();
+  }
+
+  else if (command == 'R') {
+    right();
+  }
+
+  else if (command == 'S') {
+    stopRobot();
+  }
+}
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(1000);
+
+  // Motor control pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  // Make sure motors are stopped when ESP starts
+  stopRobot();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setChannel(1);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW INIT FAILED");
+    return;
+  }
+
+  esp_now_register_recv_cb(OnDataRecv);
+
+  Serial.println();
+  Serial.println("===== ESP-B ROBOT READY =====");
+  Serial.println("Waiting for commands from ESP-A...");
+}
+
+
+// ==============================
+// MOTOR FUNCTIONS
+// ==============================
+
+void forward() {
+
+  // Left motor
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  // Right motor
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  Serial.println("FORWARD");
+}
+
+
+void backward() {
+
+  // Left motor
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  // Right motor
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  Serial.println("BACKWARD");
+}
+
+
+void left() {
+
+  // Left motor backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  // Right motor forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  Serial.println("LEFT");
+}
+
+
+void right() {
+
+  // Left motor forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  // Right motor backward
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  Serial.println("RIGHT");
+}
+
+
+void stopRobot() {
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+  Serial.println("STOP");
+}
+
+
+void loop() {
+
+  // Nothing needed here.
+  // ESP-NOW callback receives commands.
+}
