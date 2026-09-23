@@ -1,0 +1,813 @@
+
+Yes. Your 60-second test gave 1265 pulses.
+
+1. Encoder RPM
+Because the test lasted exactly 60 seconds:
+
+RPM= 
+PPR×60
+pulses in 60 s
+​
+ ×60
+The 60 cancels:
+
+RPM= 
+PPR
+1265
+​
+ 
+So we cannot get the actual RPM until we know the encoder's PPR (pulses per revolution).
+
+For example:
+
+Encoder PPR	RPM
+10	126.5 RPM
+20	63.25 RPM
+30	42.17 RPM
+40	31.63 RPM
+60	21.08 RPM
+100	12.65 RPM
+Important: 1265 pulses is your measured result, but it is not automatically 1265 revolutions.
+
+2. More importantly: how do we calculate the angle?
+For your AMR, you want something like:
+
+"Turn right 90°"
+
+or
+
+"Turn left 45°"
+
+To do this with your encoder, we need to know how many encoder pulses correspond to a wheel revolution.
+
+You already measured:
+
+1265 pulses in 60 seconds
+Now we need:
+
+PPR = pulses per wheel revolution
+​
+ 
+Once we know that, everything becomes easy.
+
+3. Your wheel
+You told me your wheel diameter is 6.6 cm.
+
+Therefore:
+
+C=πD
+C=π(6.6)
+C≈20.73 cm
+​
+ 
+So one complete wheel revolution moves the robot approximately 20.73 cm in a straight line.
+
+If your encoder gives, for example, 20 pulses per wheel revolution:
+
+1 pulse= 
+20
+20.73
+​
+ 
+1.0365 cm/pulse
+​
+ 
+Then you can calculate exactly how many pulses are required to move a certain distance.
+
+4. But turning is different
+This is the important part for your AMR.
+
+Your robot is differential drive:
+
+        FRONT
+          ↑
+
+     O         O
+     |         |
+     |  ROBOT  |
+     |         |
+     O         O
+       ←────→
+      wheels
+To rotate 90° in place, the wheels move in opposite directions.
+
+You told me your robot body diameter is approximately 14 cm.
+
+So approximately:
+
+wheel-to-wheel distance=14 cm
+For a 90° rotation, each wheel travels around a quarter-circle.
+
+Radius of each wheel's circular path:
+
+r= 
+2
+14
+​
+ =7 cm
+Distance travelled by each wheel:
+
+d= 
+2
+πr
+​
+ 
+d= 
+2
+π(7)
+​
+ 
+d≈11.0 cm
+​
+ 
+So for a 90° turn, each wheel needs to travel approximately 11 cm.
+
+5. Convert that 11 cm into encoder pulses
+This is where your encoder becomes useful.
+
+If your wheel circumference is:
+
+20.73 cm
+then one wheel revolution = 20.73 cm.
+
+Therefore:
+
+wheel revolutions for 90°= 
+20.73
+11
+​
+ 
+≈0.531 revolutions
+​
+ 
+So each wheel needs to rotate about 53.1% of one revolution.
+
+Now multiply that by your encoder PPR:
+
+pulses for 90°=0.531×PPR
+​
+ 
+Example if PPR = 20:
+0.531×20=10.62
+So approximately:
+
+11 pulses
+​
+ 
+would produce a theoretical 90° turn.
+
+6. Therefore your navigation system will eventually work like this
+Suppose you want:
+
+MOVE FORWARD 30 cm
+TURN RIGHT 90°
+MOVE FORWARD 50 cm
+Your ESP32 doesn't need to think in terms of time.
+
+Instead:
+
+Forward 30 cm
+required pulses= 
+20.73
+30
+​
+ ×PPR
+Right 90°
+required pulses= 
+20.73
+11
+​
+ ×PPR
+Then the ESP32 simply counts encoder pulses.
+
+START
+  ↓
+Move forward
+  ↓
+Count encoder pulses
+  ↓
+Target reached?
+  ↓
+YES
+  ↓
+STOP
+  ↓
+Turn right
+  ↓
+Count encoder pulses
+  ↓
+90° target reached?
+  ↓
+YES
+  ↓
+STOP
+But there is ONE thing we need to determine now
+We need the actual PPR of your LM393 encoder setup.
+
+Your 1265 pulses/60 s measurement tells us how many pulses the encoder produced while running, but it doesn't tell us how many pulses = one complete wheel revolution.
+
+Best next test
+We should make the motor/encoder rotate a known number of revolutions—for example, exactly 10 wheel revolutions—and count the pulses.
+
+Then:
+
+PPR= 
+known wheel revolutions
+total pulses
+​
+ 
+​
+ 
+Once we have that number, I can give you the exact formulas/code for:
+
+distance in cm from encoder pulses
+
+90° / 45° / 180° turns
+
+forward/backward movement
+
+and eventually A* path commands → encoder-based motor movement for your AMR.
+
+
+Got it. Forget the physical LM393 mounting for now. Use the encoder only as your wheel-motion measurement, and make the robot move on a simple coordinate grid.
+
+Let's define a scale that is easy to implement:
+
+Our coordinate system
+Let:
+
+1 grid unit = 10 cm
+
+Start = (0,0)
+
+Target = (2,3)
+
+So the robot needs to travel:
+
+20 cm in X
+
+30 cm in Y
+
+Assume the robot starts facing +Y (up).
+
+             Y
+             ↑
+       (2,3) ●  TARGET
+             │
+             │ 30 cm
+             │
+             │
+       (0,0) ●────────────→ X
+            START          20 cm
+Your wheel numbers
+You have:
+
+Wheel diameter = 6.6 cm
+
+Wheel circumference = 20.73 cm
+
+Encoder = 20 PPR
+
+Therefore:
+
+1 pulse = 20.73 / 20 = 1.0365 cm
+
+So:
+
+Move 30 cm
+30/1.0365=28.94
+≈ 29 encoder pulses
+
+Move 20 cm
+20/1.0365=19.3
+≈ 19 encoder pulses
+
+What the robot actually does
+Starting at (0,0) facing upward:
+
+Step 1 — Move 30 cm forward
+(0,0)
+  ↑
+  │
+  │ 30 cm
+  │
+(0,3)
+Target encoder count:
+
+29 pulses
+
+Both wheels forward.
+
+Step 2 — Turn RIGHT 90°
+Your robot needs to rotate from facing +Y to facing +X.
+
+For your approximately 14 cm wheel-to-wheel width, we calculated approximately:
+
+11 pulses per wheel
+
+So:
+
+LEFT wheel  → forward ~11 pulses
+RIGHT wheel → backward ~11 pulses
+Now robot faces right.
+
+Step 3 — Move 20 cm forward
+Target:
+
+19 pulses
+
+Both wheels forward.
+
+Now:
+
+             Y
+             ↑
+       (0,3) ─────────→ ● (2,3)
+                         TARGET
+             20 cm
+             ↑
+             │
+             │
+       (0,0) ●
+And you've reached:
+
+(2,3)
+​
+ 
+So your first autonomous movement test is simply
+START (0,0)
+      ↓
+FORWARD 29 pulses
+      ↓
+RIGHT 90°
+      ↓
+FORWARD 19 pulses
+      ↓
+STOP
+The important thing
+Do not use RPM to decide how far to move.
+
+RPM is useful for knowing motor speed, but for positioning you care about:
+
+encoder pulses→distance
+​
+ 
+Your basic conversion is:
+
+1 pulse≈1.0365 cm
+​
+ 
+So your ESP32 can control the robot based on pulse targets, rather than arbitrary motor-running times.
+
+One correction before we code this: because your LM393 is currently not actually mounted to the AMR wheel, the 20 PPR measurement only becomes useful for navigation if the encoder is mechanically coupled to the wheel/motor shaft with the same 1:1 relationship. If it's being spun separately by hand, the PPR itself is still 20, but it isn't measuring the AMR's actual wheel movement yet.
+
+
+BUT I ALREDY TOLD YOU THE TYRE DIAMETER IS 6.5 AND THE THE 2WD CHASIS DIAMETER IS 14 CM 
+
+
+
+
+NOW WHAT I NEED YOU DO IS GIMME THE CODE FOR MY ROBOT TO MOVE FROM THE 00 TO 2,3         AND BEFORE THAT VERY CONCISE EXPLAIN HOW IS IT GOING TO DO THAT 
+
+Yes. Using your actual values:
+
+Tyre diameter = 6.5 cm
+
+2WD chassis/wheel-to-wheel width = 14 cm
+
+Encoder = 20 PPR
+
+Previously measured motor speed = 63.25 RPM
+
+Scale: 1 grid unit = 10 cm
+
+Start = (0,0)
+
+Target = (2,3) → 20 cm right, 30 cm forward
+
+How it will move
+We'll assume the robot starts facing +Y:
+
+             (2,3) ●
+                   ↑
+                   │ 30 cm
+                   │
+(0,0) ●────────────┘
+       20 cm
+It will:
+
+Move forward 30 cm
+
+Turn 90° right
+
+Move forward 20 cm
+
+Stop → approximately (2,3)
+
+Since the encoder is not mounted on this actual robot, we cannot use encoder feedback. So we'll use your measured motor speed to calculate time-based movement.
+
+With 6.5 cm wheels:
+
+Circumference = π × 6.5 = 20.42 cm
+
+Speed ≈ 21.55 cm/s
+
+30 cm → 1.392 s
+
+20 cm → 0.928 s
+
+90° turn → approximately 0.50 s
+
+The turn calculation uses your 14 cm chassis width.
+
+Code for ESP-B — the actual robot
+This assumes the same motor wiring you already have:
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ================= MOTOR PINS =================
+#define IN1 27
+#define IN2 26
+#define IN3 25
+#define IN4 33
+
+// ================= TIMINGS
+
+NOW IMME CODE FOR ESP A  AND ESP B TO MAKE IT MOVE FROM 0,0 TO 2,3 KEEP IN MIND THAT MY RBOT TURNS LEFT IF SAID RIGHT AND RIGHT IF SAID LEFT 
+
+Yes. I’ll account for the fact that your robot physically turns LEFT when we command RIGHT, and vice versa.
+
+Movement plan
+Start (0,0)
+      │
+      │ 30 cm
+      │
+      └──────────► Target (2,3)
+          20 cm
+So ESP-A sends:
+
+F → move forward for 1.39 s
+
+R → but because your robot reverses left/right, ESP-B interprets this as the physical LEFT command to produce a physical RIGHT turn
+
+F → move forward for 0.93 s
+
+S → stop
+
+I am not changing your motor wiring/functions; I'm handling the reversed turning in the command logic.
+
+ESP-A — controller
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ESP-B MAC address
+uint8_t espBMac[] = {
+  0x20, 0x9B, 0xA9, 0x61, 0xBB, 0x20
+};
+
+typedef struct {
+  char command;
+} RobotCommand;
+
+RobotCommand outgoingData;
+esp_now_peer_info_t peerInfo;
+
+// ---------- SEND CALLBACK ----------
+void OnDataSent(const wifi_tx_info_t *tx_info,
+                esp_now_send_status_t status) {
+
+  Serial.print("[SEND] ");
+
+  if (status == ESP_NOW_SEND_SUCCESS)
+    Serial.println("SUCCESS");
+  else
+    Serial.println("FAILED");
+}
+
+// ---------- SEND COMMAND ----------
+void sendCommand(char command) {
+
+  outgoingData.command = command;
+
+  esp_err_t result = esp_now_send(
+    espBMac,
+    (uint8_t *)&outgoingData,
+    sizeof(outgoingData)
+  );
+
+  Serial.print("Command sent: ");
+  Serial.println(command);
+
+  if (result != ESP_OK) {
+    Serial.print("ERROR: ");
+    Serial.println(result);
+  }
+}
+
+// ---------- SETUP ----------
+void setup() {
+
+  Serial.begin(115200);
+  delay(1000);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setChannel(1);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW INIT FAILED");
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+
+  memset(&peerInfo, 0, sizeof(peerInfo));
+
+  memcpy(
+    peerInfo.peer_addr,
+    espBMac,
+    6
+  );
+
+  peerInfo.channel = 1;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("PEER ADD FAILED");
+    return;
+  }
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("ESP-A READY");
+  Serial.println("==============================");
+  Serial.println("Press T to move (0,0) -> (2,3)");
+}
+
+// ---------- MAIN ----------
+void loop() {
+
+  if (Serial.available()) {
+
+    char command = Serial.read();
+
+    if (command == '\n' || command == '\r')
+      return;
+
+    command = toupper(command);
+
+    if (command == 'T') {
+
+      Serial.println();
+      Serial.println("Starting movement...");
+      Serial.println("(0,0) -> (2,3)");
+
+      // --------------------------------
+      // STEP 1: MOVE FORWARD 30 cm
+      // --------------------------------
+      Serial.println("1. Moving forward 30 cm");
+
+      sendCommand('F');
+
+      delay(1390);
+
+      sendCommand('S');
+
+      delay(500);
+
+      // --------------------------------
+      // STEP 2: TURN RIGHT 90 DEGREES
+      // --------------------------------
+      Serial.println("2. Turning RIGHT 90 degrees");
+
+      /*
+         IMPORTANT:
+         Your robot turns LEFT when told RIGHT.
+
+         Therefore we send the command that
+         physically produces a RIGHT turn.
+      */
+
+      sendCommand('L');
+
+      delay(500);
+
+      sendCommand('S');
+
+      delay(500);
+
+      // --------------------------------
+      // STEP 3: MOVE FORWARD 20 cm
+      // --------------------------------
+      Serial.println("3. Moving forward 20 cm");
+
+      sendCommand('F');
+
+      delay(930);
+
+      sendCommand('S');
+
+      Serial.println();
+      Serial.println("==============================");
+      Serial.println("ARRIVED AT APPROX (2,3)");
+      Serial.println("==============================");
+    }
+  }
+}
+ESP-B — robot
+Keep your existing motor functions exactly as they are.
+
+The important part is that ESP-B receives L for the physical RIGHT turn, because of your robot's reversed turning behavior.
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ================= MOTOR PINS =================
+
+#define IN1 27
+#define IN2 26
+#define IN3 25
+#define IN4 33
+
+// ================= ESP-A MAC =================
+
+uint8_t espAMac[] = {
+  0x20, 0x9B, 0xA9, 0x60, 0xE3, 0xF4
+};
+
+// ================= DATA =================
+
+typedef struct {
+  char command;
+} RobotCommand;
+
+RobotCommand incomingData;
+
+// ================= MOTOR FUNCTIONS =================
+
+void forward() {
+
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void backward() {
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void left() {
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void right() {
+
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void stopRobot() {
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// ================= RECEIVE =================
+
+void OnDataRecv(const esp_now_recv_info_t *info,
+                const uint8_t *data,
+                int len) {
+
+  if (len != sizeof(RobotCommand))
+    return;
+
+  memcpy(&incomingData, data, sizeof(incomingData));
+
+  char command = incomingData.command;
+
+  Serial.print("[RECEIVED] ");
+  Serial.println(command);
+
+  if (command == 'F') {
+
+    forward();
+
+  }
+
+  else if (command == 'B') {
+
+    backward();
+
+  }
+
+  else if (command == 'L') {
+
+    /*
+      IMPORTANT:
+
+      Your robot's physical direction is reversed.
+
+      So ESP-A sends L when it wants a
+      PHYSICAL RIGHT turn.
+
+      We therefore call the motor function
+      that currently makes the robot turn RIGHT.
+    */
+
+    right();
+
+  }
+
+  else if (command == 'R') {
+
+    /*
+      Physical LEFT turn.
+    */
+
+    left();
+
+  }
+
+  else if (command == 'S') {
+
+    stopRobot();
+
+  }
+}
+
+// ================= SETUP =================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  stopRobot();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setChannel(1);
+
+  if (esp_now_init() != ESP_OK) {
+
+    Serial.println("ESP-NOW INIT FAILED");
+    return;
+  }
+
+  esp_now_register_recv_cb(OnDataRecv);
+
+  esp_now_peer_info_t peerInfo = {};
+
+  memcpy(
+    peerInfo.peer_addr,
+    espAMac,
+    6
+  );
+
+  peerInfo.channel = 1;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+
+    Serial.println("ESP-A PEER ADD FAILED");
+    return;
+  }
+
+  Serial.println("==============================");
+  Serial.println("ESP-B ROBOT READY");
+  Serial.println("==============================");
+}
+
+// ================= LOOP =================
+
+void loop() {
+
+}
+One important thing
+This will give you the open-loop (0,0) → (2,3) demonstration using your measured motor speed. Because the encoder is not actually mounted on the robot, the robot cannot know whether it really travelled exactly 30 cm or 20 cm. Wheel slip, battery voltage, floor friction, etc. can change the distance.
+
+So test this first at low speed / with your hand ready to stop it. The 1390 ms, 500 ms, and 930 ms values are the first calibration values—we can tune them after one physical test.
+
+
+option txtoption pdfoption markdownoption clipboard
