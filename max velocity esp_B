@@ -1,0 +1,148 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+// L298N pins
+#define IN1 27   // Left motor
+#define IN2 26   // Left motor
+#define IN3 25   // Right motor
+#define IN4 33   // Right motor
+
+// Velocity Constants derived from physical benchmark: 20 cm in 0.5s = 0.40 m/s
+const float MAX_VELOCITY = 0.40; // m/s at 100% duty cycle
+
+typedef struct {
+  char command;
+  float linear_velocity; // m/s
+  float v_left;          // m/s
+  float v_right;         // m/s
+} TelemetryMessage;
+
+TelemetryMessage receivedMessage;
+
+// Broadcast address
+uint8_t broadcastAddress[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+esp_now_peer_info_t broadcastPeer;
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void forward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void backward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+// RIGHT motor only -> robot turns LEFT
+void turnLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+// LEFT motor only -> robot turns RIGHT
+void turnRight() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// Sends command confirmation + computed speed back to ESP-A
+void sendAck(char cmd) {
+  TelemetryMessage ackMsg;
+  ackMsg.command = cmd;
+
+  switch (cmd) {
+    case 'F':
+      ackMsg.v_left  = MAX_VELOCITY;
+      ackMsg.v_right = MAX_VELOCITY;
+      ackMsg.linear_velocity = MAX_VELOCITY;
+      break;
+    case 'B':
+      ackMsg.v_left  = -MAX_VELOCITY;
+      ackMsg.v_right = -MAX_VELOCITY;
+      ackMsg.linear_velocity = -MAX_VELOCITY;
+      break;
+    case 'L':
+      ackMsg.v_left  = 0.0;
+      ackMsg.v_right = MAX_VELOCITY;
+      ackMsg.linear_velocity = MAX_VELOCITY / 2.0; // average turning linear speed
+      break;
+    case 'R':
+      ackMsg.v_left  = MAX_VELOCITY;
+      ackMsg.v_right = 0.0;
+      ackMsg.linear_velocity = MAX_VELOCITY / 2.0;
+      break;
+    case 'S':
+    default:
+      ackMsg.v_left  = 0.0;
+      ackMsg.v_right = 0.0;
+      ackMsg.linear_velocity = 0.0;
+      break;
+  }
+
+  esp_now_send(broadcastAddress, (uint8_t *)&ackMsg, sizeof(ackMsg));
+}
+
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(TelemetryMessage)) return;
+
+  memcpy(&receivedMessage, data, sizeof(receivedMessage));
+
+  switch (receivedMessage.command) {
+    case 'F': forward();    sendAck('F'); break;
+    case 'B': backward();   sendAck('B'); break;
+    case 'L': turnLeft();   sendAck('L'); break;
+    case 'R': turnRight();  sendAck('R'); break;
+    case 'S': stopMotors(); sendAck('S'); break;
+    default: break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  stopMotors();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setChannel(1);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW INIT FAILED");
+    return;
+  }
+
+  esp_now_register_recv_cb(onReceive);
+
+  memset(&broadcastPeer, 0, sizeof(broadcastPeer));
+  memcpy(broadcastPeer.peer_addr, broadcastAddress, 6);
+  broadcastPeer.channel = 1;
+  broadcastPeer.encrypt = false;
+  esp_now_add_peer(&broadcastPeer);
+
+  Serial.println("==============================");
+  Serial.println("ESP-B READY");
+  Serial.println("==============================");
+}
+
+void loop() {
+}
