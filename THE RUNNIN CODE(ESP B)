@@ -1,0 +1,684 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+// =====================================================
+// L298N MOTOR DRIVER
+// =====================================================
+
+#define ENA 14
+#define ENB 13
+
+#define IN1 27
+#define IN2 26
+
+#define IN3 25
+#define IN4 33
+
+// =====================================================
+// ENCODERS
+// =====================================================
+
+#define LEFT_ENCODER_PIN  34
+#define RIGHT_ENCODER_PIN 35
+
+// =====================================================
+// MESSAGE FROM ESP-A
+// =====================================================
+
+typedef struct {
+  char command;
+} Message;
+
+// =====================================================
+// ACK TO ESP-A
+// =====================================================
+
+typedef struct {
+  char command;
+  long leftTicks;
+  long rightTicks;
+} AckMessage;
+
+// =====================================================
+// ENCODER COUNTERS
+// =====================================================
+
+volatile long leftTicks = 0;
+volatile long rightTicks = 0;
+
+// =====================================================
+// ENCODER INTERRUPTS
+// =====================================================
+
+void IRAM_ATTR leftEncoderISR() {
+
+  leftTicks++;
+}
+
+void IRAM_ATTR rightEncoderISR() {
+
+  rightTicks++;
+}
+
+// =====================================================
+// STOP MOTORS
+// =====================================================
+
+void stopMotors() {
+
+  digitalWrite(
+    IN1,
+    LOW
+  );
+
+  digitalWrite(
+    IN2,
+    LOW
+  );
+
+  digitalWrite(
+    IN3,
+    LOW
+  );
+
+  digitalWrite(
+    IN4,
+    LOW
+  );
+
+  // ENA / ENB HIGH
+  // No PWM speed control
+
+  digitalWrite(
+    ENA,
+    HIGH
+  );
+
+  digitalWrite(
+    ENB,
+    HIGH
+  );
+}
+
+// =====================================================
+// FORWARD
+// =====================================================
+
+void moveForward() {
+
+  digitalWrite(
+    IN1,
+    HIGH
+  );
+
+  digitalWrite(
+    IN2,
+    LOW
+  );
+
+  digitalWrite(
+    IN3,
+    HIGH
+  );
+
+  digitalWrite(
+    IN4,
+    LOW
+  );
+
+  digitalWrite(
+    ENA,
+    HIGH
+  );
+
+  digitalWrite(
+    ENB,
+    HIGH
+  );
+}
+
+// =====================================================
+// BACKWARD
+// =====================================================
+
+void moveBackward() {
+
+  digitalWrite(
+    IN1,
+    LOW
+  );
+
+  digitalWrite(
+    IN2,
+    HIGH
+  );
+
+  digitalWrite(
+    IN3,
+    LOW
+  );
+
+  digitalWrite(
+    IN4,
+    HIGH
+  );
+
+  digitalWrite(
+    ENA,
+    HIGH
+  );
+
+  digitalWrite(
+    ENB,
+    HIGH
+  );
+}
+
+// =====================================================
+// TURN LEFT
+// =====================================================
+
+void turnLeft() {
+
+  // Left motor OFF
+  digitalWrite(
+    IN1,
+    LOW
+  );
+
+  digitalWrite(
+    IN2,
+    LOW
+  );
+
+  // Right motor FORWARD
+  digitalWrite(
+    IN3,
+    HIGH
+  );
+
+  digitalWrite(
+    IN4,
+    LOW
+  );
+
+  digitalWrite(
+    ENA,
+    HIGH
+  );
+
+  digitalWrite(
+    ENB,
+    HIGH
+  );
+}
+
+// =====================================================
+// TURN RIGHT
+// =====================================================
+
+void turnRight() {
+
+  // Left motor FORWARD
+  digitalWrite(
+    IN1,
+    HIGH
+  );
+
+  digitalWrite(
+    IN2,
+    LOW
+  );
+
+  // Right motor OFF
+  digitalWrite(
+    IN3,
+    LOW
+  );
+
+  digitalWrite(
+    IN4,
+    LOW
+  );
+
+  digitalWrite(
+    ENA,
+    HIGH
+  );
+
+  digitalWrite(
+    ENB,
+    HIGH
+  );
+}
+
+// =====================================================
+// SEND ACK TO ESP-A
+// =====================================================
+
+void sendACK(
+  char command,
+  long leftCount,
+  long rightCount
+) {
+
+  AckMessage ack;
+
+  ack.command = command;
+  ack.leftTicks = leftCount;
+  ack.rightTicks = rightCount;
+
+  uint8_t broadcastAddress[] = {
+    0xFF,
+    0xFF,
+    0xFF,
+    0xFF,
+    0xFF,
+    0xFF
+  };
+
+  esp_err_t result =
+    esp_now_send(
+      broadcastAddress,
+      (uint8_t *)&ack,
+      sizeof(ack)
+    );
+
+  Serial.print("ACK: ");
+  Serial.print(command);
+
+  Serial.print(" | Left ticks: ");
+  Serial.print(leftCount);
+
+  Serial.print(" | Right ticks: ");
+  Serial.print(rightCount);
+
+  if (result == ESP_OK) {
+    Serial.println(" | SENT");
+  } else {
+    Serial.println(" | FAILED");
+  }
+}
+
+// =====================================================
+// RECEIVE ESP-NOW MESSAGE
+// =====================================================
+
+void onDataRecv(
+  const esp_now_recv_info_t *info,
+  const uint8_t *data,
+  int len
+) {
+
+  // Make sure packet is correct size
+  if (len != sizeof(Message)) {
+
+    Serial.print(
+      "Wrong packet size: "
+    );
+
+    Serial.println(len);
+
+    return;
+  }
+
+  Message incoming;
+
+  memcpy(
+    &incoming,
+    data,
+    sizeof(incoming)
+  );
+
+  char command =
+    incoming.command;
+
+  Serial.print(
+    "Received command: "
+  );
+
+  Serial.println(command);
+
+  // =================================================
+  // FORWARD
+  // =================================================
+
+  if (command == 'F') {
+
+    // Reset encoder counters
+    noInterrupts();
+
+    leftTicks = 0;
+    rightTicks = 0;
+
+    interrupts();
+
+    moveForward();
+
+    sendACK(
+      'F',
+      0,
+      0
+    );
+  }
+
+  // =================================================
+  // BACKWARD
+  // =================================================
+
+  else if (command == 'B') {
+
+    noInterrupts();
+
+    leftTicks = 0;
+    rightTicks = 0;
+
+    interrupts();
+
+    moveBackward();
+
+    sendACK(
+      'B',
+      0,
+      0
+    );
+  }
+
+  // =================================================
+  // LEFT
+  // =================================================
+
+  else if (command == 'L') {
+
+    turnLeft();
+
+    sendACK(
+      'L',
+      0,
+      0
+    );
+  }
+
+  // =================================================
+  // RIGHT
+  // =================================================
+
+  else if (command == 'R') {
+
+    turnRight();
+
+    sendACK(
+      'R',
+      0,
+      0
+    );
+  }
+
+  // =================================================
+  // STOP
+  // =================================================
+
+  else if (command == 'S') {
+
+    // Stop motors first
+    stopMotors();
+
+    // Read encoder counts safely
+    noInterrupts();
+
+    long finalLeftTicks =
+      leftTicks;
+
+    long finalRightTicks =
+      rightTicks;
+
+    interrupts();
+
+    // Send encoder counts to ESP-A
+    sendACK(
+      'S',
+      finalLeftTicks,
+      finalRightTicks
+    );
+
+    Serial.print(
+      "FINAL ENCODER TICKS -> Left: "
+    );
+
+    Serial.print(
+      finalLeftTicks
+    );
+
+    Serial.print(
+      " | Right: "
+    );
+
+    Serial.println(
+      finalRightTicks
+    );
+
+    // Reset after reporting
+    noInterrupts();
+
+    leftTicks = 0;
+    rightTicks = 0;
+
+    interrupts();
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  // =================================================
+  // MOTOR PINS
+  // =================================================
+
+  pinMode(
+    ENA,
+    OUTPUT
+  );
+
+  pinMode(
+    ENB,
+    OUTPUT
+  );
+
+  pinMode(
+    IN1,
+    OUTPUT
+  );
+
+  pinMode(
+    IN2,
+    OUTPUT
+  );
+
+  pinMode(
+    IN3,
+    OUTPUT
+  );
+
+  pinMode(
+    IN4,
+    OUTPUT
+  );
+
+  // =================================================
+  // ENCODER PINS
+  // =================================================
+
+  pinMode(
+    LEFT_ENCODER_PIN,
+    INPUT
+  );
+
+  pinMode(
+    RIGHT_ENCODER_PIN,
+    INPUT
+  );
+
+  // =================================================
+  // INITIAL MOTOR STATE
+  // =================================================
+
+  stopMotors();
+
+  // =================================================
+  // ENCODER INTERRUPTS
+  // =================================================
+
+  attachInterrupt(
+    digitalPinToInterrupt(
+      LEFT_ENCODER_PIN
+    ),
+    leftEncoderISR,
+    RISING
+  );
+
+  attachInterrupt(
+    digitalPinToInterrupt(
+      RIGHT_ENCODER_PIN
+    ),
+    rightEncoderISR,
+    RISING
+  );
+
+  // =================================================
+  // WIFI
+  // =================================================
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.setChannel(1);
+
+  Serial.println(
+    "ESP-B starting..."
+  );
+
+  Serial.print(
+    "ESP-B MAC: "
+  );
+
+  Serial.println(
+    WiFi.macAddress()
+  );
+
+  // =================================================
+  // ESP-NOW
+  // =================================================
+
+  if (
+    esp_now_init() != ESP_OK
+  ) {
+
+    Serial.println(
+      "ESP-NOW INIT FAILED"
+    );
+
+    return;
+  }
+
+  // Register receive callback
+  esp_now_register_recv_cb(
+    onDataRecv
+  );
+
+  // =================================================
+  // ADD BROADCAST PEER
+  // =================================================
+
+  esp_now_peer_info_t peerInfo = {};
+
+  uint8_t broadcastAddress[] = {
+    0xFF,
+    0xFF,
+    0xFF,
+    0xFF,
+    0xFF,
+    0xFF
+  };
+
+  memcpy(
+    peerInfo.peer_addr,
+    broadcastAddress,
+    6
+  );
+
+  peerInfo.channel = 1;
+  peerInfo.encrypt = false;
+
+  if (
+    esp_now_add_peer(
+      &peerInfo
+    ) != ESP_OK
+  ) {
+
+    Serial.println(
+      "BROADCAST PEER ADD FAILED"
+    );
+
+    return;
+  }
+
+  // =================================================
+  // READY
+  // =================================================
+
+  Serial.println();
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "ESP-B READY"
+  );
+
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "Motor control: NORMAL"
+  );
+
+  Serial.println(
+    "Encoder: TICK COUNTING ONLY"
+  );
+
+  Serial.println(
+    "ENA = GPIO 14"
+  );
+
+  Serial.println(
+    "ENB = GPIO 13"
+  );
+
+  Serial.println(
+    "Left encoder = GPIO 34"
+  );
+
+  Serial.println(
+    "Right encoder = GPIO 35"
+  );
+
+  Serial.println(
+    "=============================="
+  );
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+
+  delay(5);
+}
