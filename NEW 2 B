@@ -1,0 +1,181 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ===== L298N motor pins -- unchanged wiring =====
+#define IN1 27   // Left motor
+#define IN2 26   // Left motor
+#define IN3 25   // Right motor
+#define IN4 33   // Right motor
+
+// ===== Encoder pins (LM393 modules, DO output only) =====
+#define LEFT_ENCODER_PIN  34
+#define RIGHT_ENCODER_PIN 35
+
+// ===== Timing =====
+const unsigned long KICKSTART_MS = 150;   // brief full-power burst to break static friction
+const long TICK_TOLERANCE = 2;            // allowed tick difference before correcting
+
+// ===== SPEED CONTROL (software duty cycle, applied to BOTH wheels equally) =====
+// This slows the robot down overall. The tick-based correction above still
+// works fine on top of this, since it reacts to real encoder counts, not time.
+const int SPEED_PERCENT = 50;                 // <- change this single number to adjust speed
+const unsigned long PWM_PERIOD_MS = 100;      // full on+off cycle length
+const unsigned long PWM_ON_MS = (PWM_PERIOD_MS * SPEED_PERCENT) / 100;
+
+// ---- Command message from ESP-A ----
+typedef struct {
+  char command;
+} Message;
+Message receivedMessage;
+
+// ---- Ack message back to ESP-A (now carries tick counts) ----
+typedef struct {
+  char command;
+  long leftTicks;
+  long rightTicks;
+} AckMessage;
+
+uint8_t broadcastAddress[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+esp_now_peer_info_t broadcastPeer;
+
+volatile long leftTicks  = 0;
+volatile long rightTicks = 0;
+
+volatile char currentCommand = 'S';
+volatile unsigned long commandStartMs = 0;
+
+void IRAM_ATTR leftEncoderISR()  { leftTicks++; }
+void IRAM_ATTR rightEncoderISR() { rightTicks++; }
+
+void sendAck(char cmd, long lt, long rt) {
+  AckMessage ackMsg;
+  ackMsg.command = cmd;
+  ackMsg.leftTicks = lt;
+  ackMsg.rightTicks = rt;
+  esp_now_send(broadcastAddress, (uint8_t *)&ackMsg, sizeof(ackMsg));
+}
+
+void onReceive(const esp_now_recv_info_t *info,
+               const uint8_t *data,
+               int len) {
+
+  if (len != sizeof(Message)) return;
+  memcpy(&receivedMessage, data, sizeof(receivedMessage));
+
+  char cmd = receivedMessage.command;
+  if (cmd != 'F' && cmd != 'B' && cmd != 'L' && cmd != 'R' && cmd != 'S') return;
+
+  if (cmd == 'S') {
+    // Report the final tick counts from the move that just finished,
+    // then reset so the NEXT forward/backward move starts from zero.
+    sendAck('S', leftTicks, rightTicks);
+  } else {
+    if (cmd == 'F' || cmd == 'B') {
+      leftTicks = 0;
+      rightTicks = 0;
+    }
+    sendAck(cmd, 0, 0);
+  }
+
+  currentCommand = cmd;
+  commandStartMs = millis();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+  pinMode(LEFT_ENCODER_PIN, INPUT);
+  pinMode(RIGHT_ENCODER_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(LEFT_ENCODER_PIN), leftEncoderISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(RIGHT_ENCODER_PIN), rightEncoderISR, RISING);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setChannel(1);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW INIT FAILED");
+    return;
+  }
+
+  esp_now_register_recv_cb(onReceive);
+
+  memset(&broadcastPeer, 0, sizeof(broadcastPeer));
+  memcpy(broadcastPeer.peer_addr, broadcastAddress, 6);
+  broadcastPeer.channel = 1;
+  broadcastPeer.encrypt = false;
+  esp_now_add_peer(&broadcastPeer);
+
+  Serial.println("==============================");
+  Serial.println("ESP-B READY (with encoder correction)");
+  Serial.println("==============================");
+}
+
+void loop() {
+  char cmd = currentCommand;
+
+  if (cmd == 'S') {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+    return;
+  }
+
+  unsigned long elapsed = millis() - commandStartMs;
+  bool inKickstart = (elapsed < KICKSTART_MS);
+
+  // Global speed duty cycle -- ignored during kickstart so the robot
+  // reliably breaks static friction, then applied for the rest of the move.
+  bool globalOn;
+  if (inKickstart) {
+    globalOn = true;
+  } else {
+    unsigned long cyclePos = millis() % PWM_PERIOD_MS;
+    globalOn = cyclePos < PWM_ON_MS;
+  }
+
+  int a1 = LOW, a2 = LOW, a3 = LOW, a4 = LOW;
+
+  if (cmd == 'L') {
+    a3 = globalOn ? HIGH : LOW;   // right motor only -> turns left
+  } else if (cmd == 'R') {
+    a1 = globalOn ? HIGH : LOW;   // left motor only -> turns right
+  } else if (cmd == 'F' || cmd == 'B') {
+    bool leftOn = true;
+    bool rightOn = true;
+
+    if (!inKickstart) {
+      long diff = leftTicks - rightTicks;
+      if (diff > TICK_TOLERANCE)  leftOn = false;   // left is ahead, pause it
+      if (diff < -TICK_TOLERANCE) rightOn = false;  // right is ahead, pause it
+    }
+
+    bool leftDrive  = globalOn && leftOn;
+    bool rightDrive = globalOn && rightOn;
+
+    if (cmd == 'F') {
+      a1 = leftDrive  ? HIGH : LOW;
+      a3 = rightDrive ? HIGH : LOW;
+    } else {
+      a2 = leftDrive  ? HIGH : LOW;
+      a4 = rightDrive ? HIGH : LOW;
+    }
+  }
+
+  digitalWrite(IN1, a1);
+  digitalWrite(IN2, a2);
+  digitalWrite(IN3, a3);
+  digitalWrite(IN4, a4);
+
+  yield();
+}
