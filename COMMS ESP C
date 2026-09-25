@@ -1,0 +1,637 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+#define ROBOT_ID 'C'
+
+#define GRID_SIZE 5
+
+// =====================================================
+// ROBOT C POSITION / TARGET
+// =====================================================
+
+int currentX = 4;
+int currentY = 4;
+
+int targetX = 0;
+int targetY = 0;
+
+// =====================================================
+// GRID
+// =====================================================
+
+int grid[GRID_SIZE][GRID_SIZE] = {
+
+  {0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0}
+
+};
+
+// =====================================================
+// PATH
+// =====================================================
+
+#define MAX_PATH 25
+
+struct Cell {
+
+  int x;
+  int y;
+
+};
+
+Cell path[MAX_PATH];
+
+int pathLength = 0;
+
+int nextX = -1;
+int nextY = -1;
+
+// =====================================================
+// INTENT
+// =====================================================
+
+enum Intent {
+
+  IDLE,
+  MOVE,
+  WAIT,
+  ARRIVED
+
+};
+
+Intent myIntent = IDLE;
+
+// =====================================================
+// COMMUNICATION MESSAGE
+// =====================================================
+
+struct RobotMessage {
+
+  char robotID;
+
+  int currentX;
+  int currentY;
+
+  int targetX;
+  int targetY;
+
+  int nextX;
+  int nextY;
+
+  uint8_t intent;
+
+};
+
+RobotMessage receivedRobot;
+
+// =====================================================
+// BROADCAST
+// =====================================================
+
+uint8_t broadcastAddress[] = {
+
+  0xFF,
+  0xFF,
+  0xFF,
+  0xFF,
+  0xFF,
+  0xFF
+
+};
+
+// =====================================================
+// A* NODE
+// =====================================================
+
+struct Node {
+
+  int x;
+  int y;
+
+  int g;
+  int h;
+  int f;
+
+  int parentX;
+  int parentY;
+
+  bool open;
+  bool closed;
+
+};
+
+Node nodes[GRID_SIZE][GRID_SIZE];
+
+// =====================================================
+// HEURISTIC
+// =====================================================
+
+int heuristic(
+  int x1,
+  int y1,
+  int x2,
+  int y2
+) {
+
+  return abs(x1 - x2) +
+         abs(y1 - y2);
+
+}
+
+// =====================================================
+// VALID CELL
+// =====================================================
+
+bool validCell(int x, int y) {
+
+  if (x < 0 || x >= GRID_SIZE)
+    return false;
+
+  if (y < 0 || y >= GRID_SIZE)
+    return false;
+
+  if (grid[y][x] == 1)
+    return false;
+
+  return true;
+
+}
+
+// =====================================================
+// A*
+// =====================================================
+
+bool calculateAStar() {
+
+  for (int y = 0; y < GRID_SIZE; y++) {
+
+    for (int x = 0; x < GRID_SIZE; x++) {
+
+      nodes[y][x].x = x;
+      nodes[y][x].y = y;
+
+      nodes[y][x].g = 9999;
+      nodes[y][x].h = 9999;
+      nodes[y][x].f = 9999;
+
+      nodes[y][x].parentX = -1;
+      nodes[y][x].parentY = -1;
+
+      nodes[y][x].open = false;
+      nodes[y][x].closed = false;
+
+    }
+
+  }
+
+  nodes[currentY][currentX].g = 0;
+
+  nodes[currentY][currentX].h =
+      heuristic(
+        currentX,
+        currentY,
+        targetX,
+        targetY
+      );
+
+  nodes[currentY][currentX].f =
+      nodes[currentY][currentX].h;
+
+  nodes[currentY][currentX].open = true;
+
+  while (true) {
+
+    int bestX = -1;
+    int bestY = -1;
+
+    int bestF = 9999;
+
+    for (int y = 0; y < GRID_SIZE; y++) {
+
+      for (int x = 0; x < GRID_SIZE; x++) {
+
+        if (
+          nodes[y][x].open &&
+          !nodes[y][x].closed &&
+          nodes[y][x].f < bestF
+        ) {
+
+          bestF = nodes[y][x].f;
+
+          bestX = x;
+          bestY = y;
+
+        }
+
+      }
+
+    }
+
+    if (bestX == -1)
+      return false;
+
+    if (
+      bestX == targetX &&
+      bestY == targetY
+    ) {
+
+      break;
+
+    }
+
+    nodes[bestY][bestX].closed = true;
+
+    int dx[4] = {
+      1, -1, 0, 0
+    };
+
+    int dy[4] = {
+      0, 0, 1, -1
+    };
+
+    for (int i = 0; i < 4; i++) {
+
+      int nx = bestX + dx[i];
+      int ny = bestY + dy[i];
+
+      if (!validCell(nx, ny))
+        continue;
+
+      if (nodes[ny][nx].closed)
+        continue;
+
+      int newG =
+          nodes[bestY][bestX].g + 1;
+
+      if (
+        !nodes[ny][nx].open ||
+        newG < nodes[ny][nx].g
+      ) {
+
+        nodes[ny][nx].g = newG;
+
+        nodes[ny][nx].h =
+            heuristic(
+              nx,
+              ny,
+              targetX,
+              targetY
+            );
+
+        nodes[ny][nx].f =
+            nodes[ny][nx].g +
+            nodes[ny][nx].h;
+
+        nodes[ny][nx].parentX = bestX;
+        nodes[ny][nx].parentY = bestY;
+
+        nodes[ny][nx].open = true;
+
+      }
+
+    }
+
+  }
+
+  // ===================================================
+  // RECONSTRUCT PATH
+  // ===================================================
+
+  Cell reversePath[MAX_PATH];
+
+  int length = 0;
+
+  int x = targetX;
+  int y = targetY;
+
+  while (!(x == currentX && y == currentY)) {
+
+    if (length >= MAX_PATH)
+      return false;
+
+    reversePath[length].x = x;
+    reversePath[length].y = y;
+
+    int px = nodes[y][x].parentX;
+    int py = nodes[y][x].parentY;
+
+    x = px;
+    y = py;
+
+    length++;
+
+  }
+
+  pathLength = 0;
+
+  for (int i = length - 1; i >= 0; i--) {
+
+    path[pathLength] =
+        reversePath[i];
+
+    pathLength++;
+
+  }
+
+  return true;
+
+}
+
+// =====================================================
+// PRINT PATH
+// =====================================================
+
+void printPath() {
+
+  Serial.println();
+
+  Serial.println("===== A* PATH =====");
+
+  for (int i = 0; i < pathLength; i++) {
+
+    Serial.print("(");
+    Serial.print(path[i].x);
+    Serial.print(",");
+    Serial.print(path[i].y);
+    Serial.print(")");
+
+    if (i < pathLength - 1)
+      Serial.print(" -> ");
+
+  }
+
+  Serial.println();
+
+}
+
+// =====================================================
+// SEND
+// =====================================================
+
+void sendState() {
+
+  RobotMessage message;
+
+  message.robotID = ROBOT_ID;
+
+  message.currentX = currentX;
+  message.currentY = currentY;
+
+  message.targetX = targetX;
+  message.targetY = targetY;
+
+  message.nextX = nextX;
+  message.nextY = nextY;
+
+  message.intent = myIntent;
+
+  esp_now_send(
+    broadcastAddress,
+    (uint8_t *)&message,
+    sizeof(message)
+  );
+
+}
+
+// =====================================================
+// RECEIVE
+// =====================================================
+
+void onDataRecv(
+  const esp_now_recv_info_t *info,
+  const uint8_t *data,
+  int len
+) {
+
+  if (len != sizeof(RobotMessage))
+    return;
+
+  memcpy(
+    &receivedRobot,
+    data,
+    sizeof(RobotMessage)
+  );
+
+  if (
+    receivedRobot.robotID ==
+    ROBOT_ID
+  )
+    return;
+
+  Serial.println();
+
+  Serial.println(
+    "----- ROBOT COMMUNICATION -----"
+  );
+
+  Serial.print("Received from ROBOT ");
+  Serial.println(
+    receivedRobot.robotID
+  );
+
+  Serial.print("Position: (");
+  Serial.print(
+    receivedRobot.currentX
+  );
+  Serial.print(",");
+  Serial.print(
+    receivedRobot.currentY
+  );
+  Serial.println(")");
+
+  Serial.print("Target: (");
+  Serial.print(
+    receivedRobot.targetX
+  );
+  Serial.print(",");
+  Serial.print(
+    receivedRobot.targetY
+  );
+  Serial.println(")");
+
+  Serial.print("Next cell: (");
+  Serial.print(
+    receivedRobot.nextX
+  );
+  Serial.print(",");
+  Serial.print(
+    receivedRobot.nextY
+  );
+  Serial.println(")");
+
+  // =================================================
+  // CONFLICT
+  // =================================================
+
+  if (
+    receivedRobot.nextX == nextX &&
+    receivedRobot.nextY == nextY &&
+    nextX != -1 &&
+    nextY != -1
+  ) {
+
+    Serial.println();
+    Serial.println(
+      "!!! CELL CONFLICT DETECTED !!!"
+    );
+
+    Serial.print(
+      "Both robots want cell ("
+    );
+
+    Serial.print(nextX);
+    Serial.print(",");
+    Serial.print(nextY);
+
+    Serial.println(")");
+
+    myIntent = WAIT;
+
+  }
+
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.setChannel(1);
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("ESP-C - ROBOT C");
+  Serial.println("==============================");
+
+  Serial.print("MAC: ");
+  Serial.println(
+    WiFi.macAddress()
+  );
+
+  if (
+    esp_now_init() != ESP_OK
+  ) {
+
+    Serial.println(
+      "ESP-NOW INIT FAILED"
+    );
+
+    return;
+
+  }
+
+  esp_now_register_recv_cb(
+    onDataRecv
+  );
+
+  esp_now_peer_info_t peerInfo = {};
+
+  memcpy(
+    peerInfo.peer_addr,
+    broadcastAddress,
+    6
+  );
+
+  peerInfo.channel = 1;
+
+  peerInfo.encrypt = false;
+
+  if (
+    esp_now_add_peer(
+      &peerInfo
+    ) != ESP_OK
+  ) {
+
+    Serial.println(
+      "BROADCAST PEER ADD FAILED"
+    );
+
+    return;
+
+  }
+
+  if (calculateAStar()) {
+
+    Serial.println(
+      "A* PATH FOUND"
+    );
+
+    printPath();
+
+    if (pathLength > 0) {
+
+      nextX = path[0].x;
+      nextY = path[0].y;
+
+      myIntent = MOVE;
+
+    }
+
+  } else {
+
+    Serial.println(
+      "NO PATH FOUND"
+    );
+
+    myIntent = WAIT;
+
+  }
+
+  Serial.println();
+  Serial.println("ESP-C READY");
+
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+unsigned long lastSend = 0;
+
+void loop() {
+
+  if (
+    millis() - lastSend >= 1000
+  ) {
+
+    lastSend = millis();
+
+    sendState();
+
+    Serial.println();
+    Serial.println("----- MY STATE -----");
+
+    Serial.print("Robot: ");
+    Serial.println(ROBOT_ID);
+
+    Serial.print("Position: (");
+    Serial.print(currentX);
+    Serial.print(",");
+    Serial.print(currentY);
+    Serial.println(")");
+
+    Serial.print("Target: (");
+    Serial.print(targetX);
+    Serial.print(",");
+    Serial.print(targetY);
+    Serial.println(")");
+
+    Serial.print("Next: (");
+    Serial.print(nextX);
+    Serial.print(",");
+    Serial.print(nextY);
+    Serial.println(")");
+
+  }
+
+}
