@@ -1,0 +1,188 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+// =====================================================
+// MESSAGE FORMAT
+// MUST MATCH ESP-B / ESP-C
+// =====================================================
+
+struct RobotMessage {
+
+  char robotID;
+
+  int currentX;
+  int currentY;
+
+  int targetX;
+  int targetY;
+
+  int nextX;
+  int nextY;
+
+  uint8_t intent;
+
+};
+
+RobotMessage robot;
+
+// =====================================================
+// INTENT NAME
+// =====================================================
+
+const char* intentName(
+  uint8_t intent
+) {
+
+  switch (intent) {
+
+    case 0:
+      return "IDLE";
+
+    case 1:
+      return "MOVE";
+
+    case 2:
+      return "WAIT";
+
+    case 3:
+      return "ARRIVED";
+
+    default:
+      return "UNKNOWN";
+
+  }
+
+}
+
+// =====================================================
+// RECEIVE DATA
+// =====================================================
+
+void onDataRecv(
+  const esp_now_recv_info_t *info,
+  const uint8_t *data,
+  int len
+) {
+
+  if (
+    len != sizeof(RobotMessage)
+  )
+    return;
+
+  memcpy(
+    &robot,
+    data,
+    sizeof(RobotMessage)
+  );
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.print("ROBOT ");
+  Serial.print(robot.robotID);
+  Serial.println(" COMMUNICATION");
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.print("Position : (");
+  Serial.print(robot.currentX);
+  Serial.print(",");
+  Serial.print(robot.currentY);
+  Serial.println(")");
+
+  Serial.print("Target   : (");
+  Serial.print(robot.targetX);
+  Serial.print(",");
+  Serial.print(robot.targetY);
+  Serial.println(")");
+
+  Serial.print("Next     : (");
+  Serial.print(robot.nextX);
+  Serial.print(",");
+  Serial.print(robot.nextY);
+  Serial.println(")");
+
+  Serial.print("Intent   : ");
+  Serial.println(
+    intentName(robot.intent)
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.setChannel(1);
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "ESP-A DISTRIBUTED AMR MONITOR"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.print("ESP-A MAC: ");
+
+  Serial.println(
+    WiFi.macAddress()
+  );
+
+  if (
+    esp_now_init() != ESP_OK
+  ) {
+
+    Serial.println(
+      "ESP-NOW INIT FAILED"
+    );
+
+    return;
+
+  }
+
+  esp_now_register_recv_cb(
+    onDataRecv
+  );
+
+  Serial.println();
+  Serial.println(
+    "ESP-A MONITOR READY"
+  );
+
+  Serial.println(
+    "Listening for ROBOT B and ROBOT C..."
+  );
+
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+
+  delay(10);
+
+}
