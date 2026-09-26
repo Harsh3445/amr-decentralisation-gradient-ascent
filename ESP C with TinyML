@@ -1,0 +1,1232 @@
+// =====================================================================
+//  AUTONAV v4 - ESP-C : JOB ENTRY + FLEET MONITOR   (MAC 8C:94:DF:8F:44:34)
+//  Team Gradient Ascent | SIH 2026
+//
+//  Type jobs into the Serial Monitor (115200 baud, "Newline" line ending):
+//
+//     A 4 0          Robot A goal = (4,0), starts from where it is now
+//     A 0 0 4 0      Robot A starts at (0,0), goal = (4,0)
+//     B 4 0 0 0      Robot B starts at (4,0), goal = (0,0)
+//     A 0 0 4 0 B 4 0 0 0      both jobs in one line (add GO to start)
+//     GO             robots start moving (they only move collision-free)
+//     STOP           pause movement
+//     RESET          robots back to A(0,0) B(4,4), jobs cleared
+//     DEMO1/2/3      ready-made collision scenarios (then type GO)
+//     ML             TinyML predictions for both robots right now
+//     STATUS / MAP / HELP
+//
+//  ESP-C never plans or steers. It sends the jobs, then only LISTENS:
+//  it prints each robot's shortest path with its TinyML prediction
+//  (ETA + delay risk), every predicted collision, which robot the ML
+//  priority made give way and why, the rerouted path, every step, and
+//  MISSION COMPLETE. It re-runs the robots' shared functions on the plans
+//  it hears as an independent check - same code, same data, same answer.
+// =====================================================================
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_mac.h>
+
+#define STATION_ID 'C'
+
+// =====================================================================
+//  SHARED BLOCK 1/2 : CONSTANTS, MAP, FLEET MACs, MESSAGE TYPES  (v4)
+//  Identical in all three sketches - if you edit it, edit all three.
+//  (All types are declared before any function on purpose: the Arduino
+//   IDE auto-inserts function prototypes above the first function.)
+// =====================================================================
+
+// ---------------- radio ----------------
+#define PROTO_MAGIC   0xA5
+#define PROTO_VER     4
+#define WIFI_CHANNEL  1
+
+// ---------------- map ----------------
+#define GRID_SIZE    5
+#define NONE         255
+#define MAX_PLAN     40        // max steps in a plan (moves + waits)
+#define MAX_BLOCKED  12        // max collision cells a robot may mark as obstacles
+
+// GRID_MAP[y][x] : 0 = free, 1 = static obstacle (shelf). Add shelves here.
+//                        x = 0  1  2  3  4
+static const uint8_t GRID_MAP[GRID_SIZE][GRID_SIZE] = {
+  {0, 0, 0, 0, 0},   // y = 0
+  {0, 0, 0, 0, 0},   // y = 1
+  {0, 0, 0, 0, 0},   // y = 2
+  {0, 0, 0, 0, 0},   // y = 3
+  {0, 0, 0, 0, 0}    // y = 4
+};
+
+// default start cells (used at boot and by RESET)
+#define A_START_X 0
+#define A_START_Y 0
+#define B_START_X 4
+#define B_START_Y 4
+
+// ---------------- timing ----------------
+#define STEP_MS            1500   // one synchronized step (both robots move together)
+#define STATE_PERIOD_MS     200   // robot state heartbeat
+#define CONTROL_PERIOD_MS   300   // ESP-C job/control heartbeat
+#define PEER_TIMEOUT_MS    1500   // peer silent this long -> treated as offline
+
+// ---------------- fleet MAC table ----------------
+static const uint8_t MAC_ROBOT_A[6] = {0x20, 0x9B, 0xA9, 0x61, 0xBB, 0x20};   // ESP-A  Robot 1
+static const uint8_t MAC_ROBOT_B[6] = {0x0C, 0xDC, 0x7E, 0x1B, 0x6E, 0x70};   // ESP-B  Robot 2
+static const uint8_t MAC_STATION[6] = {0x8C, 0x94, 0xDF, 0x8F, 0x44, 0x34};   // ESP-C  Job station / monitor
+
+struct FleetNode { char id; const uint8_t* mac; const char* name; };
+static const FleetNode FLEET[] = {
+  {'A', MAC_ROBOT_A, "ESP-A  Robot 1"},
+  {'B', MAC_ROBOT_B, "ESP-B  Robot 2"},
+  {'C', MAC_STATION, "ESP-C  Job station / monitor"},
+};
+static const int FLEET_SIZE = sizeof(FLEET) / sizeof(FLEET[0]);
+
+// ---------------- enums ----------------
+enum MsgType : uint8_t { MSG_STATE = 1, MSG_EVENT, MSG_CONTROL };
+
+enum PlanReason : uint8_t { PR_NONE, PR_NEW_GOAL, PR_AVOID_CELL, PR_WAIT, PR_RESET, PR_CLEARED, PR_SIDESTEP };
+
+enum ConflictType : uint8_t { CT_NONE, CT_VERTEX, CT_SWAP, CT_FOLLOW };
+
+enum Action : uint8_t { ACT_NONE, ACT_BLOCK, ACT_WAIT, ACT_SIDESTEP };
+
+enum EventCode : uint8_t { EV_CONFLICT = 1, EV_ARRIVED, EV_NO_PATH, EV_STUCK };
+
+// ---------------- messages ----------------
+struct __attribute__((packed)) MsgHeader {
+  uint8_t  magic;
+  uint8_t  ver;
+  uint8_t  type;
+  char     sender;              // 'A', 'B' robots, 'C' station
+  uint16_t seq;
+};
+
+// Robot -> everyone, every 200 ms and on every change
+struct __attribute__((packed)) StateMsg {
+  MsgHeader h;
+  uint8_t  x, y;                // current cell
+  uint8_t  gx, gy;              // goal (NONE = no job)
+  uint8_t  jobId, resetId;      // last job / reset applied from ESP-C
+  uint8_t  arrived;             // 1 = at goal, plan finished
+  uint16_t step;                // synchronized step counter
+  uint8_t  planVer;             // +1 on every new plan
+  uint8_t  seenPeerVer;         // latest plan version I have from the other robot
+  uint8_t  ready;               // 1 = my plan vs peer plan checked conflict-free at this step
+  uint8_t  readyMyVer;          //     ...for my plan version
+  uint8_t  readyPeerVer;        //     ...and the peer's plan version
+  uint8_t  running;             // GO received
+  uint8_t  planReason;          // why the last plan was made
+  uint8_t  reasonCell;          // cell involved (e.g. the collision cell now an obstacle)
+  uint32_t nonce;               // random per boot -> shared coin flip
+  uint8_t  nBlocked;            // collision cells I treat as obstacles
+  uint8_t  blocked[MAX_BLOCKED];
+  uint8_t  planLen;             // plan[t-1] = my cell at step t (repeat = wait)
+  uint8_t  plan[MAX_PLAN];
+};
+
+// Robot -> everyone: what happened and why
+struct __attribute__((packed)) EventMsg {
+  MsgHeader h;
+  uint8_t  ev;
+  uint16_t step;                // step at which it was detected
+  uint8_t  t;                   // conflict happens t steps in the future
+  uint8_t  ctype;               // ConflictType
+  uint8_t  cellA, cellB;        // where A and B would be at that moment
+  char     resolver;            // robot that changes its plan
+  uint8_t  action;              // ACT_BLOCK / ACT_WAIT / ACT_SIDESTEP
+  uint8_t  blockCell;           // cell turned into an obstacle (or sidestep cell)
+  uint8_t  coin;                // 0 -> A picked first, 1 -> B picked first
+  uint8_t  x, y;
+};
+
+// ESP-C -> robots: jobs, start positions, GO/STOP (resent every 300 ms)
+struct __attribute__((packed)) ControlMsg {
+  MsgHeader h;
+  uint8_t running;
+  uint8_t jobId[2];             // [0] = robot A, [1] = robot B
+  uint8_t gx[2], gy[2];         // goal (NONE = no job)
+  uint8_t resetId[2];           // changes -> robot jumps to (rx, ry)
+  uint8_t rx[2], ry[2];
+};
+
+// Snapshot of one robot, used by the shared planning / conflict functions
+struct RobotSnap {
+  char     id;
+  uint8_t  pos, goal, ver;
+  uint32_t nonce;
+  uint8_t  nBlocked;
+  uint8_t  blocked[MAX_BLOCKED];
+  uint8_t  planLen;
+  uint8_t  plan[MAX_PLAN];
+};
+
+struct Conflict   { uint8_t type; uint8_t t; uint8_t cellA; uint8_t cellB; };
+
+// Who fixes a conflict. 'coin' keeps its old meaning for ESP-C
+// (0 -> A picked first, 1 -> B picked first) but is now set by the ML priority.
+struct Resolution {
+  char    robot; uint8_t action; uint8_t cell; uint8_t coin;
+  float   expA, expB;           // ML expected remaining time of A and B (seconds)
+  uint8_t why;                  // WHY_* : what decided the order
+};
+enum Why : uint8_t { WHY_ML_TIME = 0, WHY_ML_RISK, WHY_TIE_ID, WHY_TAILGATE };
+
+// TinyML: trip features and predictions
+struct MlFeatures {
+  uint8_t cells;                // grid cells driven
+  uint8_t segments;             // straight runs (each one = a start + a stop)
+  uint8_t turns90;              // 90-degree turns
+  uint8_t turns180;             // U-turns
+  uint8_t nearPath;             // obstacle cells touching the route (8-neighbourhood)
+  uint8_t zoneCells;            // route cells inside the busy zone
+};
+struct MlPrediction {
+  bool       valid;
+  MlFeatures f;
+  float      eta;               // learned ETA model, seconds of driving
+  float      etaFormula;        // hand-written formula (the risk model's "exposure")
+  float      risk;              // probability 0..1 that the trip is delayed
+  uint8_t    level;             // 0 LOW, 1 MEDIUM, 2 HIGH
+  float      expected;          // eta + risk * average delay
+  float      scheduleS;         // this plan's length in synchronized steps, seconds
+};
+
+// ESP-NOW callback copies packets into a queue; loop() processes them
+struct RxItem { uint8_t mac[6]; uint8_t len; uint8_t data[250]; };
+
+// ---------------- station-only types ----------------
+struct RobotView {
+  bool     valid;
+  uint32_t lastSeen;
+  uint8_t  mac[6];
+  StateMsg s;
+  bool     printedAny;
+  uint8_t  printedVer;
+  uint8_t  arrivedStep;
+};
+
+// TinyML record per job, for the MISSION COMPLETE summary
+struct JobMl {
+  bool         valid;
+  uint8_t      jobId;
+  MlPrediction first;           // prediction for the first plan of the job
+  uint16_t     startStep;
+};
+
+// =====================================================================
+//  SHARED BLOCK 2/2 : FUNCTIONS  (identical in all three sketches)
+//  Both robots run the SAME deterministic functions on the SAME data,
+//  so they always agree on who replans - no master needed.
+// =====================================================================
+inline uint8_t cellIdx(uint8_t x, uint8_t y) { return y * GRID_SIZE + x; }
+inline uint8_t cellX(uint8_t c) { return c % GRID_SIZE; }
+inline uint8_t cellY(uint8_t c) { return c / GRID_SIZE; }
+inline bool inGrid(int x, int y) { return x >= 0 && x < GRID_SIZE && y >= 0 && y < GRID_SIZE; }
+inline bool isFree(int x, int y) { return inGrid(x, y) && GRID_MAP[y][x] == 0; }
+inline int  manhattan(int x1, int y1, int x2, int y2) { return abs(x1 - x2) + abs(y1 - y2); }
+
+inline char idFromMac(const uint8_t* m) {
+  for (int i = 0; i < FLEET_SIZE; i++) if (memcmp(m, FLEET[i].mac, 6) == 0) return FLEET[i].id;
+  return 0;
+}
+inline const uint8_t* macOf(char id) {
+  for (int i = 0; i < FLEET_SIZE; i++) if (FLEET[i].id == id) return FLEET[i].mac;
+  return nullptr;
+}
+
+inline void fillHeader(MsgHeader& h, uint8_t type, char sender, uint16_t seq) {
+  h.magic = PROTO_MAGIC; h.ver = PROTO_VER; h.type = type; h.sender = sender; h.seq = seq;
+}
+inline bool validHeader(const uint8_t* d, int len) {
+  return len >= (int)sizeof(MsgHeader) && d[0] == PROTO_MAGIC && d[1] == PROTO_VER;
+}
+
+inline const char* conflictName(uint8_t t) {
+  static const char* n[] = {"NONE", "SAME CELL", "HEAD-ON SWAP", "TAILGATE"};
+  return t < 4 ? n[t] : "?";
+}
+inline const char* reasonName(uint8_t r) {
+  static const char* n[] = {"-", "NEW GOAL", "AVOID COLLISION CELL", "WAIT 1 STEP", "START POSITION SET",
+                            "JOB CLEARED", "SIDESTEP TO MAKE WAY"};
+  return r < 7 ? n[r] : "?";
+}
+
+// integer hash (was used for the old coin flip; kept for compatibility, unused)
+inline uint32_t mix32(uint32_t x) {
+  x ^= x >> 16; x *= 0x7FEB352DUL; x ^= x >> 15; x *= 0x846CA68BUL; x ^= x >> 16;
+  return x;
+}
+
+inline bool inList(const uint8_t* l, uint8_t n, uint8_t c) {
+  for (int i = 0; i < n; i++) if (l[i] == c) return true;
+  return false;
+}
+
+// ---------------- A* : shortest 4-connected path ----------------
+// blocked[] cells are walls (start and goal are never blocked).
+// out[t-1] = cell at step t; outLen = number of steps.
+inline bool planAStar(uint8_t start, uint8_t goal, const uint8_t* blocked, uint8_t nBlocked,
+                      uint8_t* out, uint8_t& outLen) {
+  const int N = GRID_SIZE * GRID_SIZE;
+  uint16_t g[N], f[N];
+  int8_t   parent[N];
+  bool     open[N], closed[N];
+  for (int i = 0; i < N; i++) { g[i] = 0xFFFF; f[i] = 0xFFFF; parent[i] = -1; open[i] = false; closed[i] = false; }
+
+  int gx = cellX(goal), gy = cellY(goal);
+  g[start] = 0;
+  f[start] = manhattan(cellX(start), cellY(start), gx, gy);
+  open[start] = true;
+
+  const int dx[4] = {1, -1, 0, 0};
+  const int dy[4] = {0, 0, 1, -1};
+
+  while (true) {
+    int best = -1;
+    uint16_t bf = 0xFFFF;
+    for (int i = 0; i < N; i++)
+      if (open[i] && !closed[i] && f[i] < bf) { bf = f[i]; best = i; }
+    if (best < 0) return false;
+    if (best == goal) break;
+    closed[best] = true;
+
+    int bx = cellX(best), by = cellY(best);
+    for (int k = 0; k < 4; k++) {
+      int nx = bx + dx[k], ny = by + dy[k];
+      if (!isFree(nx, ny)) continue;
+      int n = cellIdx(nx, ny);
+      if (closed[n]) continue;
+      if (n != goal && inList(blocked, nBlocked, n)) continue;
+      uint16_t ng = g[best] + 1;
+      if (!open[n] || ng < g[n]) {
+        g[n] = ng;
+        f[n] = ng + manhattan(nx, ny, gx, gy);
+        parent[n] = best;
+        open[n] = true;
+      }
+    }
+  }
+
+  uint8_t rev[N];
+  int len = 0;
+  for (int c = goal; c != start; c = parent[c]) {
+    if (len >= N || parent[c] < 0) return false;
+    rev[len++] = c;
+  }
+  if (len > MAX_PLAN) return false;
+  outLen = len;
+  for (int i = 0; i < len; i++) out[i] = rev[len - 1 - i];
+  return true;
+}
+
+// where robot r is at step t (t = 0 -> now); after its plan ends it stays put
+inline uint8_t cellAt(const RobotSnap& r, int t) {
+  if (t <= 0 || r.planLen == 0) return r.pos;
+  if (t - 1 < r.planLen) return r.plan[t - 1];
+  return r.plan[r.planLen - 1];
+}
+
+// First future collision between two plans, stepping through time together.
+//   SAME CELL : both in one cell at step t
+//   SWAP      : they exchange cells between t-1 and t (head-on)
+//   TAILGATE  : one enters the cell the other is only just leaving
+inline bool detectConflict(const RobotSnap& a, const RobotSnap& b, Conflict& c) {
+  int T = (a.planLen > b.planLen ? a.planLen : b.planLen) + 1;
+  for (int t = 1; t <= T; t++) {
+    uint8_t a0 = cellAt(a, t - 1), a1 = cellAt(a, t);
+    uint8_t b0 = cellAt(b, t - 1), b1 = cellAt(b, t);
+    uint8_t type = CT_NONE;
+    if (a1 == b1)                    type = CT_VERTEX;
+    else if (a1 == b0 && b1 == a0)   type = CT_SWAP;
+    else if (a1 == b0 || b1 == a0)   type = CT_FOLLOW;
+    if (type != CT_NONE) { c.type = type; c.t = t; c.cellA = a1; c.cellB = b1; return true; }
+  }
+  return false;
+}
+
+// Replan robot r with 'cell' added as an obstacle. Not allowed on its own
+// position or goal (that could never be avoided).
+inline bool tryBlock(const RobotSnap& r, uint8_t cell, uint8_t* out, uint8_t& len) {
+  if (r.goal == NONE || cell == r.pos || cell == r.goal || r.nBlocked >= MAX_BLOCKED) return false;
+  uint8_t bl[MAX_BLOCKED];
+  memcpy(bl, r.blocked, r.nBlocked);
+  bl[r.nBlocked] = cell;
+  return planAStar(r.pos, r.goal, bl, r.nBlocked + 1, out, len);
+}
+
+inline bool canWait(const RobotSnap& r) { return r.goal != NONE && r.planLen > 0 && r.planLen < MAX_PLAN; }
+
+// Used when the collision cell can't be made an obstacle (e.g. two adjacent robots
+// that want to swap places: each one's collision cell is its own goal).
+// Robot r steps into a free neighbour the other robot isn't using, and plans its
+// way back to its goal AROUND the other robot's remaining route and parking cell.
+inline bool trySidestep(const RobotSnap& r, const RobotSnap& other, uint8_t* out, uint8_t& len) {
+  const int dx[4] = {1, -1, 0, 0};
+  const int dy[4] = {0, 0, 1, -1};
+  uint8_t o0 = cellAt(other, 0), o1 = cellAt(other, 1);
+
+  // cells to keep clear on the way back: other robot's position, route and final cell
+  uint8_t avoid[MAX_BLOCKED + MAX_PLAN + 1];
+  uint8_t na = 0;
+  for (int i = 0; i < r.nBlocked; i++) avoid[na++] = r.blocked[i];
+  avoid[na++] = other.pos;
+  for (int t = 0; t < other.planLen; t++) avoid[na++] = other.plan[t];
+
+  int best = -1, bestScore = 9999;
+  uint8_t bestRest[MAX_PLAN], bestLen = 0;
+  for (int k = 0; k < 4; k++) {
+    int nx = cellX(r.pos) + dx[k], ny = cellY(r.pos) + dy[k];
+    if (!isFree(nx, ny)) continue;
+    uint8_t n = cellIdx(nx, ny);
+    if (n == o0 || n == o1) continue;
+    int score = 0;
+    uint8_t rest[MAX_PLAN], rl = 0;
+    if (r.goal != NONE && n != r.goal) {
+      if (!planAStar(n, r.goal, avoid, na, rest, rl) &&            // around the other robot
+          !planAStar(n, r.goal, r.blocked, r.nBlocked, rest, rl))  // any route at all
+        continue;
+      score = rl;
+    }
+    for (int t = 0; t < other.planLen; t++) if (other.plan[t] == n) { score += 10; break; }
+    if (score < bestScore && rl + 1 <= MAX_PLAN) {
+      bestScore = score; best = n; bestLen = rl; memcpy(bestRest, rest, rl);
+    }
+  }
+  if (best < 0) return false;
+  out[0] = best;
+  memcpy(out + 1, bestRest, bestLen);
+  len = 1 + bestLen;
+  return true;
+}
+
+// ---------------------------------------------------------------------
+// TINYML : ETA + DELAY-RISK MODELS  (trained in Gazebo, 146 trips)
+//   ETA  = linear regression (median fit)      -> seconds of driving
+//   RISK = logistic regression (gradient descent) -> chance of a delay
+//   expected time = ETA + risk x average delay
+// Values come from ~/amr_ws/data/models.h on the laptop. After every
+// retrain, copy the new numbers into this block (same block in ESP-B).
+// ---------------------------------------------------------------------
+
+// ---- ETA model: learned from data (test error 0.28 s, 95% within 1 s) ----
+#define ML_ETA_BIAS          -0.20f     // fixed cost per trip
+#define ML_ETA_W_CELLS        1.35f     // per cell driven
+#define ML_ETA_W_SEGMENTS     0.93f     // per straight segment (start + stop)
+#define ML_ETA_W_TURN90       2.11f     // per 90-degree turn
+#define ML_ETA_W_TURN180      3.46f     // per U-turn
+
+// ---- hand-written formula (the risk model uses it as "exposure") ----
+#define ML_F_SEGMENT          0.70f
+#define ML_F_CELL             1.35f
+#define ML_F_TURN90           2.10f
+#define ML_F_TURN180          3.40f
+
+// ---- RISK model: logistic regression on standardised features ----
+// Weights are the trained values. BIAS, MEAN_* and STD_* below are ESTIMATES:
+// replace them with the exact numbers from predictRisk() in models.h.
+#define ML_RISK_BIAS         -1.40f     // ESTIMATE - replace from models.h
+#define ML_RISK_W_EXPOSURE    1.08f     // longer trips  -> more risk
+#define ML_RISK_W_NEAR       -0.26f     // obstacles near route (planned around)
+#define ML_RISK_W_ZONE        0.26f     // cells in the busy zone -> more risk
+#define ML_RISK_MEAN_EXPOSURE 13.0f     // ESTIMATE - replace from models.h
+#define ML_RISK_STD_EXPOSURE   5.0f     // ESTIMATE - replace from models.h
+#define ML_RISK_MEAN_NEAR      1.5f     // ESTIMATE - replace from models.h
+#define ML_RISK_STD_NEAR       1.5f     // ESTIMATE - replace from models.h
+#define ML_RISK_MEAN_ZONE      1.5f     // ESTIMATE - replace from models.h
+#define ML_RISK_STD_ZONE       2.0f     // ESTIMATE - replace from models.h
+#define ML_RISK_LOW_MAX        0.17f    // below = LOW    (thresholds in risk_model.json)
+#define ML_RISK_MEDIUM_MAX     0.30f    // below = MEDIUM, else HIGH
+#define ML_DELAY_COST_S       11.7f     // delayed trips were 11.7 s slower on average
+
+// ---- busy zone on this 5x5 grid (like the packing area in Gazebo) ----
+#define ML_ZONE_X0 1
+#define ML_ZONE_X1 3
+#define ML_ZONE_Y0 2
+#define ML_ZONE_Y1 3
+
+static const char* const ML_LEVEL_NAME[3] = {"LOW", "MEDIUM", "HIGH"};
+
+inline bool mlInZone(uint8_t c) {
+  uint8_t x = cellX(c), y = cellY(c);
+  return x >= ML_ZONE_X0 && x <= ML_ZONE_X1 && y >= ML_ZONE_Y0 && y <= ML_ZONE_Y1;
+}
+
+// direction of a one-cell move: 0 = +Y, 1 = +X, 2 = -Y, 3 = -X, NONE = not a move
+inline uint8_t mlDir(uint8_t from, uint8_t to) {
+  int dx = (int)cellX(to) - (int)cellX(from);
+  int dy = (int)cellY(to) - (int)cellY(from);
+  if (dx == 0 && dy == 1)  return 0;
+  if (dx == 1 && dy == 0)  return 1;
+  if (dx == 0 && dy == -1) return 2;
+  if (dx == -1 && dy == 0) return 3;
+  return NONE;
+}
+
+// Same features as features.py in Gazebo: counted from the robot's position
+// and heading along its plan. A wait (repeated cell) ends the current segment.
+inline MlFeatures mlExtract(uint8_t start, uint8_t head, const uint8_t* p, uint8_t n) {
+  MlFeatures f;
+  memset(&f, 0, sizeof(f));
+  uint8_t prev = start, h = head;
+  bool inRun = false;
+  bool near[GRID_SIZE * GRID_SIZE];
+  memset(near, 0, sizeof(near));
+
+  for (int i = -1; i < (int)n; i++) {
+    uint8_t c = (i < 0) ? start : p[i];
+    // obstacles (shelves) touching this route cell, 8-neighbourhood, counted once
+    for (int dx = -1; dx <= 1; dx++)
+      for (int dy = -1; dy <= 1; dy++) {
+        int nx = (int)cellX(c) + dx, ny = (int)cellY(c) + dy;
+        if (inGrid(nx, ny) && GRID_MAP[ny][nx] == 1) near[cellIdx(nx, ny)] = true;
+      }
+    if (i < 0) continue;
+
+    if (c == prev) { inRun = false; continue; }         // wait step
+    uint8_t d = mlDir(prev, c);
+    if (d == NONE) { inRun = false; prev = c; continue; }
+    if (d != h) {
+      uint8_t diff = (uint8_t)((d + 4 - h) % 4);
+      if (diff == 2) f.turns180++;
+      else           f.turns90++;
+      h = d;
+      inRun = false;
+    }
+    if (!inRun) { f.segments++; inRun = true; }
+    f.cells++;
+    if (mlInZone(c)) f.zoneCells++;
+    prev = c;
+  }
+  for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) if (near[i]) f.nearPath++;
+  return f;
+}
+
+inline float mlEta(const MlFeatures& f) {
+  float t = ML_ETA_BIAS + ML_ETA_W_CELLS * f.cells + ML_ETA_W_SEGMENTS * f.segments +
+            ML_ETA_W_TURN90 * f.turns90 + ML_ETA_W_TURN180 * f.turns180;
+  return t > 0.0f ? t : 0.0f;
+}
+
+inline float mlEtaFormula(const MlFeatures& f) {
+  return ML_F_SEGMENT * f.segments + ML_F_CELL * f.cells +
+         ML_F_TURN90 * f.turns90 + ML_F_TURN180 * f.turns180;
+}
+
+inline float mlRisk(float exposure, const MlFeatures& f) {
+  float z = ML_RISK_BIAS
+          + ML_RISK_W_EXPOSURE * (exposure - ML_RISK_MEAN_EXPOSURE) / ML_RISK_STD_EXPOSURE
+          + ML_RISK_W_NEAR * ((float)f.nearPath - ML_RISK_MEAN_NEAR) / ML_RISK_STD_NEAR
+          + ML_RISK_W_ZONE * ((float)f.zoneCells - ML_RISK_MEAN_ZONE) / ML_RISK_STD_ZONE;
+  return 1.0f / (1.0f + expf(-z));
+}
+
+inline MlPrediction mlPredict(uint8_t start, uint8_t head, const uint8_t* p, uint8_t n) {
+  MlPrediction m;
+  memset(&m, 0, sizeof(m));
+  m.f = mlExtract(start, head, p, n);
+  m.eta = mlEta(m.f);
+  m.etaFormula = mlEtaFormula(m.f);
+  m.risk = (m.f.cells > 0) ? mlRisk(m.etaFormula, m.f) : 0.0f;
+  m.level = (m.risk < ML_RISK_LOW_MAX) ? 0 : (m.risk < ML_RISK_MEDIUM_MAX ? 1 : 2);
+  m.expected = m.eta + m.risk * ML_DELAY_COST_S;
+  m.scheduleS = n * (STEP_MS / 1000.0f);
+  m.valid = true;
+  return m;
+}
+
+// Collision priority: each robot's expected REMAINING time, computed only
+// from data both robots share (position + plan), so both get the same number.
+// The heading is not shared, so the first move is taken as straight ahead
+// (same assumption for both robots). An idle robot scores 0 (nothing to finish).
+inline MlPrediction mlRemaining(const RobotSnap& r) {
+  MlPrediction m;
+  memset(&m, 0, sizeof(m));
+  if (r.goal == NONE || r.planLen == 0) return m;
+  uint8_t head = NONE;
+  uint8_t prev = r.pos;
+  for (int i = 0; i < r.planLen && head == NONE; i++) {
+    head = mlDir(prev, r.plan[i]);
+    prev = r.plan[i];
+  }
+  if (head == NONE) head = 0;
+  return mlPredict(r.pos, head, r.plan, r.planLen);
+}
+
+// Who fixes the conflict, and how - decided by the TinyML models:
+//   0. TAILGATE: the follower waits 1 step (it is simply too close behind).
+//   1. Both robots predict each robot's expected REMAINING time
+//      (ML ETA + risk x average delay). The robot that finishes SOONER goes
+//      first; the other one YIELDS. Tie (within 0.1 s): the lower-risk trip
+//      goes first; still tied: Robot A goes first.
+//   2. The yielding robot treats its collision cell as an OBSTACLE and
+//      replans (A*). If it can't (cell is its own start/goal, or no route),
+//      the other robot tries.
+//   3. If neither can (e.g. adjacent robots swapping places), the yielding
+//      robot steps aside into a free neighbour cell, then replans.
+//   4. Last resort: the yielding robot waits 1 step.
+// Pure function of shared data -> both robots always reach the same decision.
+inline Resolution chooseResolution(const Conflict& c, const RobotSnap& a, const RobotSnap& b) {
+  Resolution r;
+  memset(&r, 0, sizeof(r));
+  r.action = ACT_NONE; r.cell = NONE; r.why = WHY_ML_TIME;
+
+  MlPrediction pa = mlRemaining(a);
+  MlPrediction pb = mlRemaining(b);
+  r.expA = pa.expected;
+  r.expB = pb.expected;
+
+  if (c.type == CT_FOLLOW) {
+    bool aFollows = (cellAt(a, c.t) == cellAt(b, c.t - 1));
+    const RobotSnap& fol = aFollows ? a : b;
+    if (canWait(fol)) {
+      r.robot = fol.id; r.action = ACT_WAIT; r.why = WHY_TAILGATE;
+      r.coin = aFollows ? 0 : 1;
+      return r;
+    }
+  }
+
+  // who yields? (true -> A yields, B goes first)
+  bool aYields;
+  if (pa.expected > pb.expected + 0.1f)      { aYields = true;  r.why = WHY_ML_TIME; }
+  else if (pb.expected > pa.expected + 0.1f) { aYields = false; r.why = WHY_ML_TIME; }
+  else if (pa.risk > pb.risk + 0.001f)       { aYields = true;  r.why = WHY_ML_RISK; }
+  else if (pb.risk > pa.risk + 0.001f)       { aYields = false; r.why = WHY_ML_RISK; }
+  else                                       { aYields = false; r.why = WHY_TIE_ID; }
+  r.coin = aYields ? 0 : 1;                  // same meaning as before: who is picked first
+
+  const RobotSnap* order[2] = { aYields ? &a : &b, aYields ? &b : &a };
+  uint8_t tmp[MAX_PLAN];
+  uint8_t len = 0;
+  for (int i = 0; i < 2; i++) {
+    uint8_t cell = (order[i] == &a) ? c.cellA : c.cellB;
+    if (tryBlock(*order[i], cell, tmp, len)) {
+      r.robot = order[i]->id; r.action = ACT_BLOCK; r.cell = cell;
+      return r;
+    }
+  }
+  for (int i = 0; i < 2; i++) {
+    const RobotSnap& oth = (order[i] == &a) ? b : a;
+    if (trySidestep(*order[i], oth, tmp, len)) {
+      r.robot = order[i]->id; r.action = ACT_SIDESTEP; r.cell = tmp[0];
+      return r;
+    }
+  }
+  for (int i = 0; i < 2; i++)
+    if (canWait(*order[i])) { r.robot = order[i]->id; r.action = ACT_WAIT; return r; }
+  return r;                                         // nothing possible -> reported as STUCK
+}
+
+inline const char* whyName(uint8_t w) {
+  static const char* n[] = {"ML: longer expected time yields", "ML: equal time, higher risk yields",
+                            "ML: exact tie, Robot A goes first", "tailgate: follower waits"};
+  return w < 4 ? n[w] : "?";
+}
+
+inline void printCellC(uint8_t c) {
+  if (c == NONE) Serial.print("(-,-)");
+  else Serial.printf("(%u,%u)", cellX(c), cellY(c));
+}
+
+// Serial helpers shared by all three boards
+inline void printMacBytes(const uint8_t* m) {
+  Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+// =====================================================================
+// STATE
+// =====================================================================
+RobotView rv[2];                    // [0] = A, [1] = B
+JobMl     jobMl[2];                 // TinyML prediction per job (for the summary)
+
+// what ESP-C commands (resent every 300 ms)
+uint8_t cRunning = 0;
+uint8_t cJob[2]   = {0, 0};
+uint8_t cGx[2]    = {NONE, NONE}, cGy[2] = {NONE, NONE};
+uint8_t cReset[2] = {0, 0};
+uint8_t cRx[2]    = {A_START_X, B_START_X}, cRy[2] = {A_START_Y, B_START_Y};
+
+uint16_t seqNo = 0;
+uint32_t lastControl = 0;
+uint16_t lastCheckKey = 0xFFFF;
+uint16_t lastGridStep = 0;
+bool     missionDone = true;
+uint32_t statConflicts = 0, statCollisions = 0, droppedUnknown = 0;
+uint32_t statMlDecisions = 0;
+bool     colliding = false;
+
+char     lineBuf[64];
+uint8_t  lineLen = 0;
+
+QueueHandle_t rxQueue;
+
+// =====================================================================
+// HELPERS
+// =====================================================================
+bool fresh(int i) { return rv[i].valid && (millis() - rv[i].lastSeen) < PEER_TIMEOUT_MS; }
+
+void sendRaw(const void* p, size_t n) { esp_now_send(nullptr, (const uint8_t*)p, n); }
+
+void sendControl() {
+  ControlMsg m;
+  fillHeader(m.h, MSG_CONTROL, STATION_ID, seqNo++);
+  m.running = cRunning;
+  for (int i = 0; i < 2; i++) {
+    m.jobId[i] = cJob[i];  m.gx[i] = cGx[i];  m.gy[i] = cGy[i];
+    m.resetId[i] = cReset[i];  m.rx[i] = cRx[i];  m.ry[i] = cRy[i];
+  }
+  sendRaw(&m, sizeof(m));
+  lastControl = millis();
+}
+
+void snapOf(int i, RobotSnap& r) {
+  const StateMsg& s = rv[i].s;
+  r.id = 'A' + i;
+  r.pos = cellIdx(s.x, s.y);
+  r.goal = (s.gx == NONE) ? NONE : cellIdx(s.gx, s.gy);
+  r.ver = s.planVer;  r.nonce = s.nonce;
+  r.nBlocked = s.nBlocked;  memcpy(r.blocked, s.blocked, s.nBlocked);
+  r.planLen = s.planLen;    memcpy(r.plan, s.plan, s.planLen);
+}
+
+// TinyML prediction for robot i's remaining plan (same function the robots use for priority)
+MlPrediction mlOf(int i) {
+  RobotSnap r;
+  memset(&r, 0, sizeof(r));
+  snapOf(i, r);
+  return mlRemaining(r);
+}
+
+void printMlLine(const char* indent, const MlPrediction& m) {
+  Serial.printf("%sML: ETA %.1f s | risk %s %.0f%% | expected %.1f s  "
+                "(%u cells, %u segments, %u turns, %u U-turns, %u busy-zone cells)\n",
+                indent, m.eta, ML_LEVEL_NAME[m.level], m.risk * 100.0f, m.expected,
+                m.f.cells, m.f.segments, m.f.turns90, m.f.turns180, m.f.zoneCells);
+}
+
+// current (reported) or commanded position of robot i
+uint8_t posOf(int i) {
+  if (rv[i].valid && rv[i].s.resetId == cReset[i]) return cellIdx(rv[i].s.x, rv[i].s.y);
+  return cellIdx(cRx[i], cRy[i]);      // start just commanded, robot hasn't applied it yet
+}
+
+void printMap() {
+  char g[GRID_SIZE][GRID_SIZE];
+  for (int y = 0; y < GRID_SIZE; y++)
+    for (int x = 0; x < GRID_SIZE; x++) g[y][x] = GRID_MAP[y][x] ? '#' : '.';
+  for (int i = 0; i < 2; i++) {
+    if (!rv[i].valid) continue;
+    const StateMsg& s = rv[i].s;
+    for (int k = 0; k < s.planLen; k++) {
+      char& c = g[cellY(s.plan[k])][cellX(s.plan[k])];
+      if (c == '.') c = 'a' + i;
+    }
+    if (s.gx != NONE && g[s.gy][s.gx] != 'A' && g[s.gy][s.gx] != 'B') g[s.gy][s.gx] = '1' + i;
+    for (int k = 0; k < s.nBlocked; k++) {
+      char& c = g[cellY(s.blocked[k])][cellX(s.blocked[k])];
+      if (c == '.' || c == 'a' || c == 'b') c = 'x';
+    }
+  }
+  for (int i = 0; i < 2; i++) if (rv[i].valid) g[rv[i].s.y][rv[i].s.x] = 'A' + i;
+
+  Serial.println("        x: 0 1 2 3 4");
+  for (int y = 0; y < GRID_SIZE; y++) {
+    Serial.printf("     y=%d   ", y);
+    for (int x = 0; x < GRID_SIZE; x++) Serial.printf("%c ", g[y][x]);
+    Serial.println();
+  }
+  Serial.println("  A/B robot  a/b path  1/2 goal of A/B  x collision cell (obstacle)  # shelf");
+}
+
+void printStatus() {
+  Serial.println();
+  Serial.printf("---- STATUS  (%s) ----\n", cRunning ? "RUNNING" : "STOPPED - type GO to move");
+  for (int i = 0; i < 2; i++) {
+    char id = 'A' + i;
+    if (!rv[i].valid) { Serial.printf("  Robot %c: not heard yet\n", id); continue; }
+    const StateMsg& s = rv[i].s;
+    Serial.printf("  Robot %c: at (%u,%u)  goal ", id, s.x, s.y);
+    if (s.gx == NONE) Serial.print("none ");
+    else Serial.printf("(%u,%u) ", s.gx, s.gy);
+    Serial.printf(" step %u  plan v%u  %u step(s) left  %s%s%s\n", s.step, s.planVer, s.planLen,
+                  s.arrived ? "ARRIVED " : "", s.ready ? "ready" : "checking",
+                  fresh(i) ? "" : "  (OFFLINE)");
+    if (s.gx != NONE && s.planLen > 0) printMlLine("           ", mlOf(i));
+  }
+  printMap();
+  Serial.printf("  conflicts resolved: %lu (ML decisions: %lu) | real collisions: %lu | untrusted packets: %lu\n",
+                (unsigned long)statConflicts, (unsigned long)statMlDecisions,
+                (unsigned long)statCollisions, (unsigned long)droppedUnknown);
+}
+
+// ML command: both robots' predictions and who would go first right now
+void printMl() {
+  Serial.println();
+  Serial.println("---- TinyML  (ETA = linear regression, risk = logistic regression) ----");
+  bool have[2] = {false, false};
+  MlPrediction m[2];
+  for (int i = 0; i < 2; i++) {
+    char id = 'A' + i;
+    if (!rv[i].valid) { Serial.printf("  Robot %c: not heard yet\n", id); continue; }
+    const StateMsg& s = rv[i].s;
+    if (s.gx == NONE || s.planLen == 0) {
+      Serial.printf("  Robot %c: %s\n", id, s.arrived ? "arrived - nothing left to predict" : "no job");
+      continue;
+    }
+    m[i] = mlOf(i);
+    have[i] = true;
+    Serial.printf("  Robot %c: ", id);
+    printMlLine("", m[i]);
+  }
+  if (have[0] && have[1]) {
+    char first = (m[0].expected <= m[1].expected) ? 'A' : 'B';
+    Serial.printf("  If their paths collide: Robot %c goes first (%.1f s vs %.1f s), Robot %c gives way\n",
+                  first, first == 'A' ? m[0].expected : m[1].expected,
+                  first == 'A' ? m[1].expected : m[0].expected, first == 'A' ? 'B' : 'A');
+  }
+  Serial.printf("  delay cost used for expected time: %.1f s | risk thresholds: LOW < %.0f%%, MEDIUM < %.0f%%\n",
+                ML_DELAY_COST_S, ML_RISK_LOW_MAX * 100.0f, ML_RISK_MEDIUM_MAX * 100.0f);
+}
+
+void printHelp() {
+  Serial.println();
+  Serial.println("---- COMMANDS  [build v4.3 TinyML]  (x = 0..4 left->right, y = 0..4 top->bottom) ----");
+  Serial.println("  A gx gy          goal for Robot A            e.g.  A 4 0");
+  Serial.println("  A sx sy gx gy    start + goal for Robot A    e.g.  A 0 0 4 0");
+  Serial.println("  B ...            same for Robot B            e.g.  B 4 0 0 0");
+  Serial.println("  both at once     A 0 0 4 0, B 4 0 0 0      (comma optional; add GO at the end to start)");
+  Serial.println("  GO / STOP        start / pause movement");
+  Serial.println("  RESET            A->(0,0) B->(4,4), jobs cleared");
+  Serial.println("  DEMO1            head-on:   A (0,0)->(4,0)   B (4,0)->(0,0)");
+  Serial.println("  DEMO2            crossing:  A (0,2)->(4,2)   B (2,0)->(2,4)");
+  Serial.println("  DEMO3            diagonal:  A (0,0)->(4,4)   B (4,4)->(0,0)");
+  Serial.println("  DEMO4            ML priority: A long trip (0,1)->(4,1), B short trip (2,3)->(2,0)");
+  Serial.println("  ML               TinyML predictions for both robots + who would go first");
+  Serial.println("  STATUS / MAP / HELP");
+}
+
+// =====================================================================
+// COMMANDS
+// =====================================================================
+bool validCell(int x, int y, const char* what) {
+  if (!inGrid(x, y)) { Serial.printf("[ERROR] %s (%d,%d) is outside the %dx%d grid\n", what, x, y, GRID_SIZE, GRID_SIZE); return false; }
+  if (!isFree(x, y)) { Serial.printf("[ERROR] %s (%d,%d) is an obstacle\n", what, x, y); return false; }
+  return true;
+}
+
+// start given only if hasStart
+bool setJob(int i, bool hasStart, int sx, int sy, int gx, int gy) {
+  char id = 'A' + i;
+  int o = 1 - i;
+  if (hasStart) {
+    if (cRunning) { Serial.println("[ERROR] type STOP before changing start positions"); return false; }
+    if (!validCell(sx, sy, "start")) return false;
+    uint8_t otherPos = posOf(o);
+    if (cellIdx(sx, sy) == otherPos) {
+      Serial.printf("[ERROR] start (%d,%d) is where Robot %c is standing\n", sx, sy, 'A' + o);
+      return false;
+    }
+  }
+  if (!validCell(gx, gy, "goal")) return false;
+  if (cGx[o] != NONE && cGx[o] == gx && cGy[o] == gy) {
+    Serial.printf("[ERROR] goal (%d,%d) is already Robot %c's goal - two robots can't end in one cell\n",
+                  gx, gy, 'A' + o);
+    return false;
+  }
+  if (hasStart) { cReset[i]++; cRx[i] = sx; cRy[i] = sy; }
+  cJob[i]++;
+  if (cJob[i] == 0) cJob[i] = 1;
+  cGx[i] = gx;  cGy[i] = gy;
+  missionDone = false;
+  lastCheckKey = 0xFFFF;
+
+  Serial.println();
+  Serial.printf("[JOB] Robot %c: ", id);
+  if (hasStart) Serial.printf("start (%d,%d) -> ", sx, sy);
+  else { Serial.print("from current cell ");  printCellC(posOf(i));  Serial.print(" -> "); }
+  Serial.printf("goal (%d,%d)   sent to ESP-%c\n", gx, gy, id);
+  sendControl();
+  return true;
+}
+
+void doReset() {
+  cRunning = 0;
+  for (int i = 0; i < 2; i++) { cReset[i]++; cJob[i]++; if (!cJob[i]) cJob[i] = 1; cGx[i] = NONE; cGy[i] = NONE; }
+  cRx[0] = A_START_X; cRy[0] = A_START_Y; cRx[1] = B_START_X; cRy[1] = B_START_Y;
+  missionDone = true;
+  lastGridStep = 0;
+  Serial.println("\n[RESET] robots -> A(0,0)  B(4,4), jobs cleared, STOPPED");
+  sendControl();
+}
+
+void runDemo(int n) {
+  cRunning = 0;
+  cGx[0] = cGx[1] = NONE;                          // avoid "same goal" rejection between demos
+  // move both starts out of each other's way first
+  int s[4][8] = {
+    {0, 0, 4, 0,   4, 0, 0, 0},                    // DEMO1 head-on in row 0
+    {0, 2, 4, 2,   2, 0, 2, 4},                    // DEMO2 crossing at (2,2)
+    {0, 0, 4, 4,   4, 4, 0, 0},                    // DEMO3 opposite corners
+    {0, 1, 4, 1,   2, 3, 2, 0},                    // DEMO4 A long trip vs B short trip, meet at (2,1)
+  };
+  int* d = s[n - 1];
+  cReset[0]++; cRx[0] = d[0]; cRy[0] = d[1];
+  cReset[1]++; cRx[1] = d[4]; cRy[1] = d[5];
+  cJob[0]++; if (!cJob[0]) cJob[0] = 1; cGx[0] = d[2]; cGy[0] = d[3];
+  cJob[1]++; if (!cJob[1]) cJob[1] = 1; cGx[1] = d[6]; cGy[1] = d[7];
+  missionDone = false;
+  lastCheckKey = 0xFFFF;
+  lastGridStep = 0;
+  Serial.printf("\n[DEMO%d] Robot A (%d,%d)->(%d,%d)   Robot B (%d,%d)->(%d,%d)\n",
+                n, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+  if (n == 4)
+    Serial.println("        A has the longer trip -> the ML should make A give way at (2,1)");
+  Serial.println("        watch the plans + collision handling below, then type GO");
+  sendControl();
+}
+
+// Parses every "A/B + 2 or 4 numbers" group on the line, plus an optional GO at the end
+void processJobLine(char* line) {
+  for (char* p = line; *p; p++) if (*p == ',' || *p == ';' || *p == '(' || *p == ')') *p = ' ';
+
+  char* tok[24];
+  int nt = 0;
+  for (char* t = strtok(line, " \t"); t && nt < 24; t = strtok(nullptr, " \t")) tok[nt++] = t;
+
+  bool go = false;
+  int jobs = 0;
+  int k = 0;
+  while (k < nt) {
+    if (!strcmp(tok[k], "GO")) { go = true; k++; continue; }
+    if (strcmp(tok[k], "A") && strcmp(tok[k], "B")) {
+      Serial.printf("[ERROR] expected A or B, got \"%s\"\n", tok[k]);
+      return;
+    }
+    int i = tok[k][0] - 'A';
+    int v[4], n = 0;
+    k++;
+    while (k < nt && n < 4 && (isdigit((unsigned char)tok[k][0]) || tok[k][0] == '-')) v[n++] = atoi(tok[k++]);
+    if (n == 2)      { if (!setJob(i, false, 0, 0, v[0], v[1])) return; }
+    else if (n == 4) { if (!setJob(i, true, v[0], v[1], v[2], v[3])) return; }
+    else { Serial.printf("[ERROR] Robot %c needs 2 numbers (goal) or 4 (start + goal)\n", 'A' + i); return; }
+    jobs++;
+  }
+  if (jobs == 2) Serial.println("[JOB] both jobs sent together - robots plan and check each other now");
+  if (go) {
+    cRunning = 1;
+    lastGridStep = 0;
+    Serial.println("\n[GO] robots move one synchronized step at a time, only on collision-free plans");
+    sendControl();
+  } else if (jobs) {
+    Serial.println("      type GO when the [CHECK] line says NO COLLISION");
+  }
+}
+
+void processCommand(char* line) {
+  for (char* p = line; *p; p++) *p = toupper(*p);
+  while (*line == ' ') line++;
+  if (!*line) return;
+
+  if (!strcmp(line, "GO")) {
+    cRunning = 1;
+    lastGridStep = 0;
+    Serial.println("\n[GO] robots move one synchronized step at a time, only on collision-free plans");
+    sendControl();
+    return;
+  }
+  if (!strcmp(line, "STOP"))   { cRunning = 0; Serial.println("\n[STOP] movement paused"); sendControl(); return; }
+  if (!strcmp(line, "RESET"))  { doReset(); return; }
+  if (!strcmp(line, "STATUS") || !strcmp(line, "MAP") || !strcmp(line, "M")) { printStatus(); return; }
+  if (!strcmp(line, "HELP") || !strcmp(line, "H") || !strcmp(line, "?")) { printHelp(); return; }
+  if (!strcmp(line, "ML"))    { printMl(); return; }
+  if (!strcmp(line, "DEMO1")) { runDemo(1); return; }
+  if (!strcmp(line, "DEMO2")) { runDemo(2); return; }
+  if (!strcmp(line, "DEMO3")) { runDemo(3); return; }
+  if (!strcmp(line, "DEMO4")) { runDemo(4); return; }
+
+  // One or more jobs on one line, e.g.  "A 0 0 4 0 B 4 0 0 0"  or  "A 4 0 B 0 0 GO"
+  if (line[0] == 'A' || line[0] == 'B') { processJobLine(line); return; }
+  Serial.printf("[ERROR] unknown command \"%s\" - type HELP\n", line);
+}
+
+void handleSerial() {
+  while (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == '\n' || ch == '\r') {
+      lineBuf[lineLen] = 0;
+      if (lineLen) processCommand(lineBuf);
+      lineLen = 0;
+    } else if (lineLen < sizeof(lineBuf) - 1) {
+      lineBuf[lineLen++] = ch;
+    }
+  }
+}
+
+// =====================================================================
+// MONITOR: what the robots are telling each other
+// =====================================================================
+void printPlan(int i) {
+  const StateMsg& s = rv[i].s;
+  char id = 'A' + i;
+  if (s.gx == NONE && s.planLen == 0) return;
+  Serial.println();
+  Serial.printf("[PLAN] Robot %c  plan v%u  (%s", id, s.planVer, reasonName(s.planReason));
+  if (s.planReason == PR_AVOID_CELL) { Serial.print(" "); printCellC(s.reasonCell); }
+  Serial.println(")");
+  Serial.print("       ");
+  printCellC(cellIdx(s.x, s.y));
+  for (int k = 0; k < s.planLen; k++) { Serial.print(" -> "); printCellC(s.plan[k]); }
+  Serial.printf("   = %u step(s)\n", s.planLen);
+  if (s.nBlocked) {
+    Serial.print("       collision cells treated as obstacles: ");
+    for (int k = 0; k < s.nBlocked; k++) { printCellC(s.blocked[k]); Serial.print(" "); }
+    Serial.println();
+  }
+  if (s.gx != NONE && s.planLen > 0) {
+    MlPrediction m = mlOf(i);
+    printMlLine("       ", m);
+    // remember the first prediction of each job for the MISSION COMPLETE summary
+    if (!jobMl[i].valid || jobMl[i].jobId != s.jobId) {
+      jobMl[i].valid = true;
+      jobMl[i].jobId = s.jobId;
+      jobMl[i].first = m;
+      jobMl[i].startStep = s.step;
+    }
+  }
+}
+
+// ESP-C re-runs the same collision check itself as an independent verification
+void crossCheck() {
+  if (!fresh(0) || !fresh(1)) return;
+  const StateMsg& a = rv[0].s;
+  const StateMsg& b = rv[1].s;
+  if (a.step != b.step || a.seenPeerVer != b.planVer || b.seenPeerVer != a.planVer) return;
+  uint16_t key = ((uint16_t)a.planVer << 8) | b.planVer;
+  if (key == lastCheckKey) return;
+  RobotSnap sa, sb;
+  snapOf(0, sa);
+  snapOf(1, sb);
+  Conflict c;
+  if (detectConflict(sa, sb, c)) return;           // robots are still resolving it
+  lastCheckKey = key;
+  if (a.planLen == 0 && b.planLen == 0) return;
+  Serial.printf("\n[CHECK] ESP-C verified plans A v%u + B v%u: NO COLLISION at any step", a.planVer, b.planVer);
+  Serial.println(cRunning ? "" : "  -> type GO");
+}
+
+void onEvent(const EventMsg& e) {
+  char who = e.h.sender;
+  if (e.ev == EV_CONFLICT) {
+    statConflicts++;
+    Serial.println();
+    Serial.printf("[COLLISION PREDICTED] %s in %u step(s): Robot A would be at ", conflictName(e.ctype), e.t);
+    printCellC(e.cellA);  Serial.print(", Robot B at ");  printCellC(e.cellB);  Serial.println();
+
+    // The robots decided with the TinyML priority. 'coin' tells us which robot the
+    // ML picked to give way (0 = A, 1 = B). ESP-C recomputes the numbers itself.
+    char picked = e.coin ? 'B' : 'A';
+    if (e.ctype != CT_FOLLOW) {
+      statMlDecisions++;
+      if (rv[0].valid && rv[1].valid) {
+        RobotSnap sa, sb;
+        snapOf(0, sa);
+        snapOf(1, sb);
+        Conflict c;
+        c.type = e.ctype;  c.t = e.t;  c.cellA = e.cellA;  c.cellB = e.cellB;
+        Resolution mine = chooseResolution(c, sa, sb);
+        Serial.printf("   ML priority: Robot A expected %.1f s, Robot B expected %.1f s -> %s\n",
+                      mine.expA, mine.expB, whyName(mine.why));
+        if (mine.robot != e.resolver || mine.action != e.action)
+          Serial.println("   (ESP-C computed this from the plans it heard; the robots decided on their latest plans)");
+      }
+      Serial.printf("   -> Robot %c gives way, Robot %c keeps its route\n", picked, picked == 'A' ? 'B' : 'A');
+    }
+
+    if (e.action == ACT_BLOCK) {
+      if (e.resolver != picked)
+        Serial.printf("   Robot %c cannot avoid that cell (its own start/goal) -> Robot %c reroutes instead\n",
+                      picked, e.resolver);
+      Serial.printf("   Robot %c treats ", e.resolver);
+      printCellC(e.blockCell);
+      Serial.println(" as an OBSTACLE and replans");
+    } else if (e.action == ACT_SIDESTEP) {
+      Serial.printf("   neither robot can avoid its collision cell (it is its own start/goal)\n");
+      Serial.printf("   -> Robot %c steps aside to ", e.resolver);
+      printCellC(e.blockCell);
+      Serial.println(" to make way, then replans");
+    } else if (e.action == ACT_WAIT) {
+      if (e.ctype == CT_FOLLOW) Serial.printf("   Robot %c is the follower -> waits 1 step\n", e.resolver);
+      else                      Serial.printf("   no detour possible -> Robot %c waits 1 step\n", e.resolver);
+    }
+  } else if (e.ev == EV_ARRIVED) {
+    rv[who - 'A'].arrivedStep = e.step;
+    Serial.printf("\n[ARRIVED] Robot %c reached its goal (%u,%u) at step %u\n", who, e.x, e.y, e.step);
+  } else if (e.ev == EV_NO_PATH) {
+    Serial.printf("\n[ERROR] Robot %c: no path from (%u,%u) to its goal\n", who, e.x, e.y);
+  } else if (e.ev == EV_STUCK) {
+    Serial.printf("\n[STUCK] conflict %s cannot be resolved by rerouting or waiting - change a goal\n",
+                  conflictName(e.ctype));
+  }
+}
+
+void checkMission() {
+  if (missionDone) return;
+  bool any = false;
+  for (int i = 0; i < 2; i++) {
+    if (cGx[i] == NONE) continue;
+    any = true;
+    if (!rv[i].valid) return;
+    const StateMsg& s = rv[i].s;
+    if (s.jobId != cJob[i] || !s.arrived) return;
+  }
+  if (!any) return;
+  missionDone = true;
+  cRunning = 0;
+  sendControl();
+  Serial.println();
+  Serial.println("==================================================================");
+  Serial.println("  MISSION COMPLETE - all robots reached their goals");
+  for (int i = 0; i < 2; i++) {
+    if (cGx[i] == NONE) continue;
+    Serial.printf("    Robot %c: goal (%u,%u) reached at step %u\n", 'A' + i, cGx[i], cGy[i], rv[i].arrivedStep);
+    if (jobMl[i].valid && jobMl[i].jobId == cJob[i]) {
+      const MlPrediction& m = jobMl[i].first;
+      Serial.printf("             TinyML at job start: ETA %.1f s, risk %s %.0f%%, expected %.1f s | took %u steps\n",
+                    m.eta, ML_LEVEL_NAME[m.level], m.risk * 100.0f, m.expected,
+                    (unsigned)(rv[i].arrivedStep - jobMl[i].startStep));
+    }
+  }
+  Serial.printf("    collisions predicted & resolved: %lu (ML priority decisions: %lu) | real collisions: %lu\n",
+                (unsigned long)statConflicts, (unsigned long)statMlDecisions, (unsigned long)statCollisions);
+  Serial.println("  (auto-STOP) enter new jobs, DEMO1/2/3/4, or RESET");
+  Serial.println("==================================================================");
+  statConflicts = 0;
+  statMlDecisions = 0;
+}
+
+void onState(const StateMsg& s, const uint8_t* mac) {
+  int i = s.h.sender - 'A';
+  if (i < 0 || i > 1) return;
+  RobotView& r = rv[i];
+  bool first = !r.valid;
+  uint8_t oldX = r.s.x, oldY = r.s.y;
+  uint16_t oldStep = r.s.step;
+
+  r.s = s;  r.valid = true;  r.lastSeen = millis();
+  memcpy(r.mac, mac, 6);
+
+  if (first) {
+    Serial.printf("[NET] Robot %c online  MAC ", s.h.sender);
+    printMacBytes(mac);
+    Serial.printf("  at (%u,%u)\n", s.x, s.y);
+  }
+  if (!r.printedAny || r.printedVer != s.planVer) {
+    r.printedAny = true;
+    r.printedVer = s.planVer;
+    printPlan(i);
+  }
+  if (!first && s.step != oldStep && cRunning) {
+    if (s.x != oldX || s.y != oldY)
+      Serial.printf("[STEP %u] Robot %c (%u,%u) -> (%u,%u)\n", s.step, s.h.sender, oldX, oldY, s.x, s.y);
+    else if (s.gx != NONE && !s.arrived)
+      Serial.printf("[STEP %u] Robot %c waits at (%u,%u)\n", s.step, s.h.sender, s.x, s.y);
+  }
+  // after both robots finished a step, draw the grid
+  if (fresh(0) && fresh(1) && rv[0].s.step == rv[1].s.step && rv[0].s.step > lastGridStep && cRunning) {
+    lastGridStep = rv[0].s.step;
+    printMap();
+  }
+  // real collision alarm (should never fire)
+  bool same = fresh(0) && fresh(1) && rv[0].s.x == rv[1].s.x && rv[0].s.y == rv[1].s.y;
+  if (same && !colliding) {
+    statCollisions++;
+    Serial.printf("\n!!!!! REAL COLLISION at (%u,%u) !!!!!\n", rv[0].s.x, rv[0].s.y);
+  }
+  colliding = same;
+
+  crossCheck();
+  checkMission();
+}
+
+// =====================================================================
+// NETWORK
+// =====================================================================
+void checkOwnMac() {
+  // Read the MAC straight from eFuse: works even before the Wi-Fi driver has
+  // finished starting (WiFi.macAddress() returns 00:00:.. at that moment)
+  uint8_t mine[6] = {0};
+  esp_read_mac(mine, ESP_MAC_WIFI_STA);
+  Serial.print("  this board MAC : ");  printMacBytes(mine);             Serial.println();
+  Serial.print("  expected MAC   : ");  printMacBytes(macOf(STATION_ID)); Serial.println();
+  if (memcmp(mine, macOf(STATION_ID), 6) != 0)
+    Serial.println("  !!! WARNING: MAC MISMATCH - wrong sketch on this board !!!");
+}
+
+bool addFleetPeers() {
+  for (int i = 0; i < FLEET_SIZE; i++) {
+    if (FLEET[i].id == STATION_ID) continue;
+    esp_now_peer_info_t pi = {};
+    memcpy(pi.peer_addr, FLEET[i].mac, 6);
+    pi.channel = WIFI_CHANNEL;
+    pi.encrypt = false;
+    if (esp_now_add_peer(&pi) != ESP_OK) return false;
+    Serial.print("  peer added     : ");  printMacBytes(FLEET[i].mac);
+    Serial.printf("  (%s)\n", FLEET[i].name);
+  }
+  return true;
+}
+
+void handlePacket(const RxItem& it) {
+  if (!validHeader(it.data, it.len)) return;
+  MsgHeader h;
+  memcpy(&h, it.data, sizeof(h));
+  char id = idFromMac(it.mac);
+  if (id == 0 || id != h.sender) { droppedUnknown++; return; }
+
+  if (h.type == MSG_STATE && it.len == sizeof(StateMsg)) {
+    StateMsg s;  memcpy(&s, it.data, sizeof(s));  onState(s, it.mac);
+  } else if (h.type == MSG_EVENT && it.len == sizeof(EventMsg)) {
+    EventMsg e;  memcpy(&e, it.data, sizeof(e));  onEvent(e);
+  }
+}
+
+void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len <= 0 || len > 250) return;
+  RxItem it;
+  memcpy(it.mac, info->src_addr, 6);
+  it.len = len;
+  memcpy(it.data, data, len);
+  xQueueSend(rxQueue, &it, 0);
+}
+
+// =====================================================================
+// SETUP / LOOP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(800);
+  WiFi.mode(WIFI_STA);
+  WiFi.setChannel(WIFI_CHANNEL);
+  rxQueue = xQueueCreate(24, sizeof(RxItem));
+  memset(rv, 0, sizeof(rv));
+  memset(jobMl, 0, sizeof(jobMl));
+
+  Serial.println();
+  Serial.println("==============================================");
+  Serial.println("  AUTONAV v4 - ESP-C : JOB ENTRY + MONITOR");
+  Serial.println("  build v4.3  (TinyML priority: the ML decides who gives way)");
+  checkOwnMac();
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW INIT FAILED"); while (true) delay(1000); }
+  esp_now_register_recv_cb(onDataRecv);
+  if (!addFleetPeers()) { Serial.println("PEER SETUP FAILED"); while (true) delay(1000); }
+  Serial.println("==============================================");
+  printHelp();
+  Serial.println("\nType both jobs on one line, e.g.  A 0 0 4 0, B 4 0 0 0   then   GO   (or DEMO4 for the ML demo)");
+}
+
+void loop() {
+  RxItem it;
+  while (xQueueReceive(rxQueue, &it, 0) == pdTRUE) handlePacket(it);
+  handleSerial();
+  if (millis() - lastControl >= CONTROL_PERIOD_MS) sendControl();
+  delay(5);
+}
