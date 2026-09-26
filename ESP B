@@ -1,0 +1,834 @@
+// =====================================================================
+//  AUTONAV v4 - ESP-B : ROBOT 2   (MAC 0C:DC:7E:1B:6E:70)
+//  Team Gradient Ascent | SIH 2026
+//
+//  What this robot does, in a loop until it reaches its goal:
+//    1. Gets a goal (and optionally a start cell) typed into ESP-C
+//    2. Plans the SHORTEST path with A*
+//    3. Sends its full plan to the other robot and to ESP-C (ESP-NOW)
+//    4. Both robots check the two plans step-by-step for a collision
+//    5. If one is predicted: a shared coin flip picks ONE robot, which
+//       treats the collision cell as an OBSTACLE and replans -> back to 3
+//    6. When both plans are collision-free (and ESP-C said GO), both
+//       robots take ONE step together, then repeat from 4
+//  Movement is simulated (position update). Motor code: see doMove().
+//  Needs ESP32 Arduino core 3.x.
+// =====================================================================
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_mac.h>
+
+#ifndef ROBOT_ID
+#define ROBOT_ID 'B'          // ESP-B = Robot 2  - do not change
+#endif
+
+#if ROBOT_ID == 'A'
+#define PEER_ID 'B'
+#define START_X A_START_X
+#define START_Y A_START_Y
+#else
+#define PEER_ID 'A'
+#define START_X B_START_X
+#define START_Y B_START_Y
+#endif
+
+// =====================================================================
+//  SHARED BLOCK 1/2 : CONSTANTS, MAP, FLEET MACs, MESSAGE TYPES  (v4)
+//  Identical in all three sketches - if you edit it, edit all three.
+//  (All types are declared before any function on purpose: the Arduino
+//   IDE auto-inserts function prototypes above the first function.)
+// =====================================================================
+
+// ---------------- radio ----------------
+#define PROTO_MAGIC   0xA5
+#define PROTO_VER     4
+#define WIFI_CHANNEL  1
+
+// ---------------- map ----------------
+#define GRID_SIZE    5
+#define NONE         255
+#define MAX_PLAN     40        // max steps in a plan (moves + waits)
+#define MAX_BLOCKED  12        // max collision cells a robot may mark as obstacles
+
+// GRID_MAP[y][x] : 0 = free, 1 = static obstacle (shelf). Add shelves here.
+//                        x = 0  1  2  3  4
+static const uint8_t GRID_MAP[GRID_SIZE][GRID_SIZE] = {
+  {0, 0, 0, 0, 0},   // y = 0
+  {0, 0, 0, 0, 0},   // y = 1
+  {0, 0, 0, 0, 0},   // y = 2
+  {0, 0, 0, 0, 0},   // y = 3
+  {0, 0, 0, 0, 0}    // y = 4
+};
+
+// default start cells (used at boot and by RESET)
+#define A_START_X 0
+#define A_START_Y 0
+#define B_START_X 4
+#define B_START_Y 4
+
+// ---------------- timing ----------------
+#define STEP_MS            1500   // one synchronized step (both robots move together)
+#define STATE_PERIOD_MS     200   // robot state heartbeat
+#define CONTROL_PERIOD_MS   300   // ESP-C job/control heartbeat
+#define PEER_TIMEOUT_MS    1500   // peer silent this long -> treated as offline
+
+// ---------------- fleet MAC table ----------------
+static const uint8_t MAC_ROBOT_A[6] = {0x20, 0x9B, 0xA9, 0x61, 0xBB, 0x20};   // ESP-A  Robot 1
+static const uint8_t MAC_ROBOT_B[6] = {0x0C, 0xDC, 0x7E, 0x1B, 0x6E, 0x70};   // ESP-B  Robot 2
+static const uint8_t MAC_STATION[6] = {0x8C, 0x94, 0xDF, 0x8F, 0x44, 0x34};   // ESP-C  Job station / monitor
+
+struct FleetNode { char id; const uint8_t* mac; const char* name; };
+static const FleetNode FLEET[] = {
+  {'A', MAC_ROBOT_A, "ESP-A  Robot 1"},
+  {'B', MAC_ROBOT_B, "ESP-B  Robot 2"},
+  {'C', MAC_STATION, "ESP-C  Job station / monitor"},
+};
+static const int FLEET_SIZE = sizeof(FLEET) / sizeof(FLEET[0]);
+
+// ---------------- enums ----------------
+enum MsgType : uint8_t { MSG_STATE = 1, MSG_EVENT, MSG_CONTROL };
+
+enum PlanReason : uint8_t { PR_NONE, PR_NEW_GOAL, PR_AVOID_CELL, PR_WAIT, PR_RESET, PR_CLEARED, PR_SIDESTEP };
+
+enum ConflictType : uint8_t { CT_NONE, CT_VERTEX, CT_SWAP, CT_FOLLOW };
+
+enum Action : uint8_t { ACT_NONE, ACT_BLOCK, ACT_WAIT, ACT_SIDESTEP };
+
+enum EventCode : uint8_t { EV_CONFLICT = 1, EV_ARRIVED, EV_NO_PATH, EV_STUCK };
+
+// ---------------- messages ----------------
+struct __attribute__((packed)) MsgHeader {
+  uint8_t  magic;
+  uint8_t  ver;
+  uint8_t  type;
+  char     sender;              // 'A', 'B' robots, 'C' station
+  uint16_t seq;
+};
+
+// Robot -> everyone, every 200 ms and on every change
+struct __attribute__((packed)) StateMsg {
+  MsgHeader h;
+  uint8_t  x, y;                // current cell
+  uint8_t  gx, gy;              // goal (NONE = no job)
+  uint8_t  jobId, resetId;      // last job / reset applied from ESP-C
+  uint8_t  arrived;             // 1 = at goal, plan finished
+  uint16_t step;                // synchronized step counter
+  uint8_t  planVer;             // +1 on every new plan
+  uint8_t  seenPeerVer;         // latest plan version I have from the other robot
+  uint8_t  ready;               // 1 = my plan vs peer plan checked conflict-free at this step
+  uint8_t  readyMyVer;          //     ...for my plan version
+  uint8_t  readyPeerVer;        //     ...and the peer's plan version
+  uint8_t  running;             // GO received
+  uint8_t  planReason;          // why the last plan was made
+  uint8_t  reasonCell;          // cell involved (e.g. the collision cell now an obstacle)
+  uint32_t nonce;               // random per boot -> shared coin flip
+  uint8_t  nBlocked;            // collision cells I treat as obstacles
+  uint8_t  blocked[MAX_BLOCKED];
+  uint8_t  planLen;             // plan[t-1] = my cell at step t (repeat = wait)
+  uint8_t  plan[MAX_PLAN];
+};
+
+// Robot -> everyone: what happened and why
+struct __attribute__((packed)) EventMsg {
+  MsgHeader h;
+  uint8_t  ev;
+  uint16_t step;                // step at which it was detected
+  uint8_t  t;                   // conflict happens t steps in the future
+  uint8_t  ctype;               // ConflictType
+  uint8_t  cellA, cellB;        // where A and B would be at that moment
+  char     resolver;            // robot that changes its plan
+  uint8_t  action;              // ACT_BLOCK / ACT_WAIT / ACT_SIDESTEP
+  uint8_t  blockCell;           // cell turned into an obstacle (or sidestep cell)
+  uint8_t  coin;                // 0 -> A picked first, 1 -> B picked first
+  uint8_t  x, y;
+};
+
+// ESP-C -> robots: jobs, start positions, GO/STOP (resent every 300 ms)
+struct __attribute__((packed)) ControlMsg {
+  MsgHeader h;
+  uint8_t running;
+  uint8_t jobId[2];             // [0] = robot A, [1] = robot B
+  uint8_t gx[2], gy[2];         // goal (NONE = no job)
+  uint8_t resetId[2];           // changes -> robot jumps to (rx, ry)
+  uint8_t rx[2], ry[2];
+};
+
+// Snapshot of one robot, used by the shared planning / conflict functions
+struct RobotSnap {
+  char     id;
+  uint8_t  pos, goal, ver;
+  uint32_t nonce;
+  uint8_t  nBlocked;
+  uint8_t  blocked[MAX_BLOCKED];
+  uint8_t  planLen;
+  uint8_t  plan[MAX_PLAN];
+};
+
+struct Conflict   { uint8_t type; uint8_t t; uint8_t cellA; uint8_t cellB; };
+struct Resolution { char robot; uint8_t action; uint8_t cell; uint8_t coin; };
+
+// ESP-NOW callback copies packets into a queue; loop() processes them
+struct RxItem { uint8_t mac[6]; uint8_t len; uint8_t data[250]; };
+
+// ---------------- robot-only types ----------------
+struct PeerView { bool valid; uint32_t lastSeen; StateMsg s; };
+
+// =====================================================================
+//  SHARED BLOCK 2/2 : FUNCTIONS  (identical in all three sketches)
+//  Both robots run the SAME deterministic functions on the SAME data,
+//  so they always agree on who replans - no master needed.
+// =====================================================================
+inline uint8_t cellIdx(uint8_t x, uint8_t y) { return y * GRID_SIZE + x; }
+inline uint8_t cellX(uint8_t c) { return c % GRID_SIZE; }
+inline uint8_t cellY(uint8_t c) { return c / GRID_SIZE; }
+inline bool inGrid(int x, int y) { return x >= 0 && x < GRID_SIZE && y >= 0 && y < GRID_SIZE; }
+inline bool isFree(int x, int y) { return inGrid(x, y) && GRID_MAP[y][x] == 0; }
+inline int  manhattan(int x1, int y1, int x2, int y2) { return abs(x1 - x2) + abs(y1 - y2); }
+
+inline char idFromMac(const uint8_t* m) {
+  for (int i = 0; i < FLEET_SIZE; i++) if (memcmp(m, FLEET[i].mac, 6) == 0) return FLEET[i].id;
+  return 0;
+}
+inline const uint8_t* macOf(char id) {
+  for (int i = 0; i < FLEET_SIZE; i++) if (FLEET[i].id == id) return FLEET[i].mac;
+  return nullptr;
+}
+
+inline void fillHeader(MsgHeader& h, uint8_t type, char sender, uint16_t seq) {
+  h.magic = PROTO_MAGIC; h.ver = PROTO_VER; h.type = type; h.sender = sender; h.seq = seq;
+}
+inline bool validHeader(const uint8_t* d, int len) {
+  return len >= (int)sizeof(MsgHeader) && d[0] == PROTO_MAGIC && d[1] == PROTO_VER;
+}
+
+inline const char* conflictName(uint8_t t) {
+  static const char* n[] = {"NONE", "SAME CELL", "HEAD-ON SWAP", "TAILGATE"};
+  return t < 4 ? n[t] : "?";
+}
+inline const char* reasonName(uint8_t r) {
+  static const char* n[] = {"-", "NEW GOAL", "AVOID COLLISION CELL", "WAIT 1 STEP", "START POSITION SET",
+                            "JOB CLEARED", "SIDESTEP TO MAKE WAY"};
+  return r < 7 ? n[r] : "?";
+}
+
+// integer hash -> used as a coin flip both robots compute identically
+inline uint32_t mix32(uint32_t x) {
+  x ^= x >> 16; x *= 0x7FEB352DUL; x ^= x >> 15; x *= 0x846CA68BUL; x ^= x >> 16;
+  return x;
+}
+
+inline bool inList(const uint8_t* l, uint8_t n, uint8_t c) {
+  for (int i = 0; i < n; i++) if (l[i] == c) return true;
+  return false;
+}
+
+// ---------------- A* : shortest 4-connected path ----------------
+// blocked[] cells are walls (start and goal are never blocked).
+// out[t-1] = cell at step t; outLen = number of steps.
+inline bool planAStar(uint8_t start, uint8_t goal, const uint8_t* blocked, uint8_t nBlocked,
+                      uint8_t* out, uint8_t& outLen) {
+  const int N = GRID_SIZE * GRID_SIZE;
+  uint16_t g[N], f[N];
+  int8_t   parent[N];
+  bool     open[N], closed[N];
+  for (int i = 0; i < N; i++) { g[i] = 0xFFFF; f[i] = 0xFFFF; parent[i] = -1; open[i] = false; closed[i] = false; }
+
+  int gx = cellX(goal), gy = cellY(goal);
+  g[start] = 0;
+  f[start] = manhattan(cellX(start), cellY(start), gx, gy);
+  open[start] = true;
+
+  const int dx[4] = {1, -1, 0, 0};
+  const int dy[4] = {0, 0, 1, -1};
+
+  while (true) {
+    int best = -1;
+    uint16_t bf = 0xFFFF;
+    for (int i = 0; i < N; i++)
+      if (open[i] && !closed[i] && f[i] < bf) { bf = f[i]; best = i; }
+    if (best < 0) return false;
+    if (best == goal) break;
+    closed[best] = true;
+
+    int bx = cellX(best), by = cellY(best);
+    for (int k = 0; k < 4; k++) {
+      int nx = bx + dx[k], ny = by + dy[k];
+      if (!isFree(nx, ny)) continue;
+      int n = cellIdx(nx, ny);
+      if (closed[n]) continue;
+      if (n != goal && inList(blocked, nBlocked, n)) continue;
+      uint16_t ng = g[best] + 1;
+      if (!open[n] || ng < g[n]) {
+        g[n] = ng;
+        f[n] = ng + manhattan(nx, ny, gx, gy);
+        parent[n] = best;
+        open[n] = true;
+      }
+    }
+  }
+
+  uint8_t rev[N];
+  int len = 0;
+  for (int c = goal; c != start; c = parent[c]) {
+    if (len >= N || parent[c] < 0) return false;
+    rev[len++] = c;
+  }
+  if (len > MAX_PLAN) return false;
+  outLen = len;
+  for (int i = 0; i < len; i++) out[i] = rev[len - 1 - i];
+  return true;
+}
+
+// where robot r is at step t (t = 0 -> now); after its plan ends it stays put
+inline uint8_t cellAt(const RobotSnap& r, int t) {
+  if (t <= 0 || r.planLen == 0) return r.pos;
+  if (t - 1 < r.planLen) return r.plan[t - 1];
+  return r.plan[r.planLen - 1];
+}
+
+// First future collision between two plans, stepping through time together.
+//   SAME CELL : both in one cell at step t
+//   SWAP      : they exchange cells between t-1 and t (head-on)
+//   TAILGATE  : one enters the cell the other is only just leaving
+inline bool detectConflict(const RobotSnap& a, const RobotSnap& b, Conflict& c) {
+  int T = (a.planLen > b.planLen ? a.planLen : b.planLen) + 1;
+  for (int t = 1; t <= T; t++) {
+    uint8_t a0 = cellAt(a, t - 1), a1 = cellAt(a, t);
+    uint8_t b0 = cellAt(b, t - 1), b1 = cellAt(b, t);
+    uint8_t type = CT_NONE;
+    if (a1 == b1)                    type = CT_VERTEX;
+    else if (a1 == b0 && b1 == a0)   type = CT_SWAP;
+    else if (a1 == b0 || b1 == a0)   type = CT_FOLLOW;
+    if (type != CT_NONE) { c.type = type; c.t = t; c.cellA = a1; c.cellB = b1; return true; }
+  }
+  return false;
+}
+
+// Replan robot r with 'cell' added as an obstacle. Not allowed on its own
+// position or goal (that could never be avoided).
+inline bool tryBlock(const RobotSnap& r, uint8_t cell, uint8_t* out, uint8_t& len) {
+  if (r.goal == NONE || cell == r.pos || cell == r.goal || r.nBlocked >= MAX_BLOCKED) return false;
+  uint8_t bl[MAX_BLOCKED];
+  memcpy(bl, r.blocked, r.nBlocked);
+  bl[r.nBlocked] = cell;
+  return planAStar(r.pos, r.goal, bl, r.nBlocked + 1, out, len);
+}
+
+inline bool canWait(const RobotSnap& r) { return r.goal != NONE && r.planLen > 0 && r.planLen < MAX_PLAN; }
+
+// Used when the collision cell can't be made an obstacle (e.g. two adjacent robots
+// that want to swap places: each one's collision cell is its own goal).
+// Robot r steps into a free neighbour the other robot isn't using, and plans its
+// way back to its goal AROUND the other robot's remaining route and parking cell.
+inline bool trySidestep(const RobotSnap& r, const RobotSnap& other, uint8_t* out, uint8_t& len) {
+  const int dx[4] = {1, -1, 0, 0};
+  const int dy[4] = {0, 0, 1, -1};
+  uint8_t o0 = cellAt(other, 0), o1 = cellAt(other, 1);
+
+  // cells to keep clear on the way back: other robot's position, route and final cell
+  uint8_t avoid[MAX_BLOCKED + MAX_PLAN + 1];
+  uint8_t na = 0;
+  for (int i = 0; i < r.nBlocked; i++) avoid[na++] = r.blocked[i];
+  avoid[na++] = other.pos;
+  for (int t = 0; t < other.planLen; t++) avoid[na++] = other.plan[t];
+
+  int best = -1, bestScore = 9999;
+  uint8_t bestRest[MAX_PLAN], bestLen = 0;
+  for (int k = 0; k < 4; k++) {
+    int nx = cellX(r.pos) + dx[k], ny = cellY(r.pos) + dy[k];
+    if (!isFree(nx, ny)) continue;
+    uint8_t n = cellIdx(nx, ny);
+    if (n == o0 || n == o1) continue;
+    int score = 0;
+    uint8_t rest[MAX_PLAN], rl = 0;
+    if (r.goal != NONE && n != r.goal) {
+      if (!planAStar(n, r.goal, avoid, na, rest, rl) &&            // around the other robot
+          !planAStar(n, r.goal, r.blocked, r.nBlocked, rest, rl))  // any route at all
+        continue;
+      score = rl;
+    }
+    for (int t = 0; t < other.planLen; t++) if (other.plan[t] == n) { score += 10; break; }
+    if (score < bestScore && rl + 1 <= MAX_PLAN) {
+      bestScore = score; best = n; bestLen = rl; memcpy(bestRest, rest, rl);
+    }
+  }
+  if (best < 0) return false;
+  out[0] = best;
+  memcpy(out + 1, bestRest, bestLen);
+  len = 1 + bestLen;
+  return true;
+}
+
+// Who fixes the conflict, and how:
+//   1. Coin flip (hash of both boot nonces + conflict + plan versions) picks a robot.
+//      That robot treats its collision cell as an OBSTACLE and replans (A*).
+//   2. If it can't (cell is its own start/goal, or no route), the other robot tries.
+//   3. If neither can (e.g. adjacent robots swapping places), one steps
+//      aside into a free neighbour cell to make way, then replans.
+//   4. Last resort: one of them waits 1 step.
+//   A TAILGATE is always fixed by the follower waiting 1 step.
+inline Resolution chooseResolution(const Conflict& c, const RobotSnap& a, const RobotSnap& b) {
+  Resolution r;
+  r.robot = 0; r.action = ACT_NONE; r.cell = NONE;
+  uint32_t seed = a.nonce ^ (b.nonce * 2654435761UL) ^ ((uint32_t)c.t << 8) ^
+                  ((uint32_t)c.cellA << 16) ^ ((uint32_t)c.cellB << 24) ^
+                  ((uint32_t)a.ver * 40503UL) ^ ((uint32_t)b.ver * 9973UL);
+  r.coin = mix32(seed) & 1;
+
+  if (c.type == CT_FOLLOW) {
+    bool aFollows = (cellAt(a, c.t) == cellAt(b, c.t - 1));
+    const RobotSnap& fol = aFollows ? a : b;
+    if (canWait(fol)) { r.robot = fol.id; r.action = ACT_WAIT; return r; }
+  }
+
+  const RobotSnap* order[2] = { r.coin ? &b : &a, r.coin ? &a : &b };
+  uint8_t tmp[MAX_PLAN];
+  uint8_t len = 0;
+  for (int i = 0; i < 2; i++) {
+    uint8_t cell = (order[i] == &a) ? c.cellA : c.cellB;
+    if (tryBlock(*order[i], cell, tmp, len)) {
+      r.robot = order[i]->id; r.action = ACT_BLOCK; r.cell = cell;
+      return r;
+    }
+  }
+  for (int i = 0; i < 2; i++) {
+    const RobotSnap& oth = (order[i] == &a) ? b : a;
+    if (trySidestep(*order[i], oth, tmp, len)) {
+      r.robot = order[i]->id; r.action = ACT_SIDESTEP; r.cell = tmp[0];
+      return r;
+    }
+  }
+  for (int i = 0; i < 2; i++)
+    if (canWait(*order[i])) { r.robot = order[i]->id; r.action = ACT_WAIT; return r; }
+  return r;                                         // nothing possible -> reported as STUCK
+}
+
+inline void printCellC(uint8_t c) {
+  if (c == NONE) Serial.print("(-,-)");
+  else Serial.printf("(%u,%u)", cellX(c), cellY(c));
+}
+
+// Serial helpers shared by all three boards
+inline void printMacBytes(const uint8_t* m) {
+  Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+// =====================================================================
+// ROBOT STATE
+// =====================================================================
+uint8_t  pos        = 0;
+uint8_t  goal       = NONE;
+uint8_t  jobId      = 0;
+uint8_t  resetId    = 0;
+bool     arrived    = false;
+uint16_t step       = 0;
+
+uint8_t  plan[MAX_PLAN];
+uint8_t  planLen    = 0;
+uint8_t  planVer    = 0;
+uint8_t  planReason = PR_NONE;
+uint8_t  reasonCell = NONE;
+
+uint8_t  blocked[MAX_BLOCKED];              // collision cells I now treat as obstacles
+uint8_t  nBlocked   = 0;
+
+bool     ready        = false;
+uint8_t  readyMyVer   = 0;
+uint8_t  readyPeerVer = 0;
+bool     running      = false;
+
+uint32_t nonce     = 0;
+uint16_t seqNo     = 0;
+uint32_t lastMove  = 0;
+uint32_t lastState = 0;
+uint16_t stuckKey  = 0xFFFF;
+uint32_t droppedUnknown = 0;
+
+PeerView peer;
+QueueHandle_t rxQueue;
+
+// =====================================================================
+// SNAPSHOTS for the shared functions
+// =====================================================================
+void snapSelf(RobotSnap& r) {
+  r.id = ROBOT_ID;  r.pos = pos;  r.goal = goal;  r.ver = planVer;  r.nonce = nonce;
+  r.nBlocked = nBlocked;  memcpy(r.blocked, blocked, nBlocked);
+  r.planLen = planLen;    memcpy(r.plan, plan, planLen);
+}
+
+void snapPeer(RobotSnap& r) {
+  const StateMsg& s = peer.s;
+  r.id = PEER_ID;
+  r.pos = cellIdx(s.x, s.y);
+  r.goal = (s.gx == NONE) ? NONE : cellIdx(s.gx, s.gy);
+  r.ver = s.planVer;  r.nonce = s.nonce;
+  r.nBlocked = s.nBlocked;  memcpy(r.blocked, s.blocked, s.nBlocked);
+  r.planLen = s.planLen;    memcpy(r.plan, s.plan, s.planLen);
+}
+
+// =====================================================================
+// SENDING
+// =====================================================================
+void sendRaw(const void* p, size_t n) {
+  esp_now_send(nullptr, (const uint8_t*)p, n);     // NULL -> every fleet peer (unicast, ACKed)
+}
+
+void broadcastState() {
+  StateMsg m;
+  memset(&m, 0, sizeof(m));
+  fillHeader(m.h, MSG_STATE, ROBOT_ID, seqNo++);
+  m.x = cellX(pos);  m.y = cellY(pos);
+  m.gx = (goal == NONE) ? NONE : cellX(goal);
+  m.gy = (goal == NONE) ? NONE : cellY(goal);
+  m.jobId = jobId;  m.resetId = resetId;
+  m.arrived = arrived;
+  m.step = step;
+  m.planVer = planVer;
+  m.seenPeerVer = peer.valid ? peer.s.planVer : 0;
+  m.ready = ready;  m.readyMyVer = readyMyVer;  m.readyPeerVer = readyPeerVer;
+  m.running = running;
+  m.planReason = planReason;  m.reasonCell = reasonCell;
+  m.nonce = nonce;
+  m.nBlocked = nBlocked;  memcpy(m.blocked, blocked, nBlocked);
+  m.planLen = planLen;    memcpy(m.plan, plan, planLen);
+  sendRaw(&m, sizeof(m));
+  lastState = millis();
+}
+
+void emitEvent(uint8_t ev, const Conflict* c, const Resolution* r) {
+  EventMsg e;
+  memset(&e, 0, sizeof(e));
+  fillHeader(e.h, MSG_EVENT, ROBOT_ID, seqNo++);
+  e.ev = ev;  e.step = step;
+  e.x = cellX(pos);  e.y = cellY(pos);
+  e.blockCell = NONE;
+  if (c) { e.t = c->t; e.ctype = c->type; e.cellA = c->cellA; e.cellB = c->cellB; }
+  if (r) { e.resolver = r->robot; e.action = r->action; e.blockCell = r->cell; e.coin = r->coin; }
+  sendRaw(&e, sizeof(e));
+}
+
+// =====================================================================
+// PLANNING
+// =====================================================================
+void printPath(const char* who, uint8_t from, const uint8_t* p, uint8_t n) {
+  Serial.print(who);
+  printCellC(from);
+  for (int i = 0; i < n; i++) { Serial.print(" -> "); printCellC(p[i]); }
+  Serial.printf("   (%u steps)\n", n);
+}
+
+void setPlan(const uint8_t* p, uint8_t n, uint8_t reason, uint8_t cell) {
+  memcpy(plan, p, n);
+  planLen = n;
+  planVer++;
+  planReason = reason;
+  reasonCell = cell;
+  ready = false;
+  Serial.printf("[%c] PLAN v%u (%s", ROBOT_ID, planVer, reasonName(reason));
+  if (reason == PR_AVOID_CELL) { Serial.print(" "); printCellC(cell); }
+  Serial.print(")\n");
+  printPath("      path: ", pos, plan, planLen);
+  if (nBlocked) {
+    Serial.print("      treating as obstacles: ");
+    for (int i = 0; i < nBlocked; i++) { printCellC(blocked[i]); Serial.print(" "); }
+    Serial.println();
+  }
+  broadcastState();
+}
+
+void checkArrived() {
+  if (!arrived && goal != NONE && planLen == 0 && pos == goal) {
+    arrived = true;
+    nBlocked = 0;
+    Serial.printf("[%c] *** REACHED GOAL (%u,%u) at step %u ***\n", ROBOT_ID, cellX(pos), cellY(pos), step);
+    emitEvent(EV_ARRIVED, nullptr, nullptr);
+  }
+}
+
+void newGoal(uint8_t g, uint8_t job) {
+  jobId = job;
+  goal = g;
+  nBlocked = 0;
+  arrived = false;
+  if (g == NONE) {
+    uint8_t dummy[1] = {0};
+    setPlan(dummy, 0, PR_CLEARED, NONE);
+    Serial.printf("[%c] job cleared\n", ROBOT_ID);
+    return;
+  }
+  Serial.printf("[%c] NEW JOB #%u: goal (%u,%u)\n", ROBOT_ID, job, cellX(g), cellY(g));
+  uint8_t p[MAX_PLAN], n = 0;
+  if (!planAStar(pos, goal, blocked, 0, p, n)) {
+    Serial.printf("[%c] NO PATH to goal\n", ROBOT_ID);
+    emitEvent(EV_NO_PATH, nullptr, nullptr);
+    uint8_t dummy[1] = {0};
+    setPlan(dummy, 0, PR_NEW_GOAL, NONE);
+    return;
+  }
+  setPlan(p, n, PR_NEW_GOAL, NONE);
+  checkArrived();
+}
+
+void applyReset(uint8_t rid, uint8_t x, uint8_t y) {
+  resetId = rid;
+  pos = cellIdx(x, y);
+  arrived = false;
+  nBlocked = 0;
+  Serial.printf("[%c] START POSITION set to (%u,%u)\n", ROBOT_ID, x, y);
+  uint8_t p[MAX_PLAN], n = 0;
+  if (goal != NONE && planAStar(pos, goal, blocked, 0, p, n)) setPlan(p, n, PR_RESET, NONE);
+  else { uint8_t dummy[1] = {0}; setPlan(dummy, 0, PR_RESET, NONE); }
+  checkArrived();
+}
+
+// The chosen robot changes its own plan (the other one just waits for it)
+void applyResolution(const Conflict& c, const Resolution& r) {
+  Serial.printf("[%c] COLLISION PREDICTED: %s in %u step(s), A at ", ROBOT_ID, conflictName(c.type), c.t);
+  printCellC(c.cellA);  Serial.print(", B at ");  printCellC(c.cellB);
+  Serial.printf("  -> coin=%u, I (%c) resolve it\n", r.coin, ROBOT_ID);
+  emitEvent(EV_CONFLICT, &c, &r);
+
+  if (r.action == ACT_BLOCK) {
+    RobotSnap me;
+    snapSelf(me);
+    uint8_t p[MAX_PLAN], n = 0;
+    if (!tryBlock(me, r.cell, p, n)) return;        // cannot happen: same check both sides
+    blocked[nBlocked++] = r.cell;
+    setPlan(p, n, PR_AVOID_CELL, r.cell);
+  } else if (r.action == ACT_SIDESTEP) {
+    RobotSnap me, other;
+    snapSelf(me);
+    snapPeer(other);
+    uint8_t p[MAX_PLAN], n = 0;
+    if (!trySidestep(me, other, p, n)) return;
+    arrived = false;
+    setPlan(p, n, PR_SIDESTEP, p[0]);
+  } else if (r.action == ACT_WAIT) {
+    memmove(plan + 1, plan, planLen);
+    plan[0] = pos;
+    planLen++;
+    uint8_t copy[MAX_PLAN];
+    memcpy(copy, plan, planLen);
+    planVer--;                                      // setPlan() increments it again
+    setPlan(copy, planLen, PR_WAIT, pos);
+  }
+}
+
+// =====================================================================
+// ONE STEP  (both robots execute this at the same step number)
+// =====================================================================
+void doMove() {
+  uint8_t from = pos;
+  if (planLen > 0) {
+    pos = plan[0];
+    memmove(plan, plan + 1, planLen - 1);
+    planLen--;
+  }
+  // ------------------------------------------------------------------
+  // HARDWARE HOOK: drive from 'from' to 'pos' here (one grid cell),
+  // confirm with encoders before continuing.
+  // ------------------------------------------------------------------
+  step++;
+  lastMove = millis();
+  ready = false;
+
+  if (pos != from)
+    Serial.printf("[%c] STEP %u: moved (%u,%u) -> (%u,%u)   %u step(s) left\n",
+                  ROBOT_ID, step, cellX(from), cellY(from), cellX(pos), cellY(pos), planLen);
+  else if (goal != NONE && !arrived)
+    Serial.printf("[%c] STEP %u: waiting at (%u,%u)\n", ROBOT_ID, step, cellX(pos), cellY(pos));
+
+  checkArrived();
+  broadcastState();
+}
+
+// =====================================================================
+// THE COORDINATION LOOP  (runs continuously until goals are reached)
+// =====================================================================
+void setReady(bool r, uint8_t peerVer) {
+  if (r == ready && (!r || (readyMyVer == planVer && readyPeerVer == peerVer))) return;
+  ready = r;
+  readyMyVer = planVer;
+  readyPeerVer = peerVer;
+  broadcastState();
+}
+
+void coordinate() {
+  uint32_t now = millis();
+  bool peerOnline = peer.valid && (now - peer.lastSeen) < PEER_TIMEOUT_MS;
+
+  // Peer offline -> nothing to coordinate with, move alone
+  if (!peerOnline) {
+    if (running && planLen > 0 && now - lastMove >= STEP_MS) doMove();
+    return;
+  }
+  const StateMsg& p = peer.s;
+
+  // ---- step synchronisation ----
+  if (p.step > step + 1) {                           // I fell behind (e.g. rebooted)
+    step = p.step;
+    ready = false;
+    broadcastState();
+    return;
+  }
+  if (p.step == step + 1) {                          // peer already took this step
+    if (ready && readyMyVer == planVer) doMove();    // it saw my agreed plan -> I take it too
+    else { step++; lastMove = now; ready = false; broadcastState(); }   // stay put this step
+    return;
+  }
+  if (p.step != step) return;                        // peer behind -> wait for it
+
+  // ---- both robots must be looking at each other's latest plan ----
+  if (p.seenPeerVer != planVer) { setReady(false, 0); return; }
+
+  RobotSnap me, other;
+  snapSelf(me);
+  snapPeer(other);
+  const RobotSnap& a = (ROBOT_ID == 'A') ? me : other;
+  const RobotSnap& b = (ROBOT_ID == 'A') ? other : me;
+
+  // ---- collision check on the two full plans ----
+  Conflict c;
+  if (detectConflict(a, b, c)) {
+    setReady(false, 0);
+    Resolution r = chooseResolution(c, a, b);        // same answer on both robots
+    if (r.robot == ROBOT_ID) {
+      applyResolution(c, r);                         // -> new plan -> loop checks again
+    } else if (r.action == ACT_NONE) {
+      uint16_t key = ((uint16_t)a.ver << 8) | b.ver;
+      if (key != stuckKey) {
+        stuckKey = key;
+        Serial.printf("[%c] STUCK: no reroute or wait resolves the conflict\n", ROBOT_ID);
+        emitEvent(EV_STUCK, &c, &r);
+      }
+    }
+    return;
+  }
+
+  // ---- no collision: I'm ready. Move when the peer is ready too ----
+  setReady(true, p.planVer);
+  bool peerReady = p.ready && p.readyMyVer == p.planVer && p.readyPeerVer == planVer;
+  if (running && peerReady && now - lastMove >= STEP_MS) doMove();
+}
+
+// =====================================================================
+// NETWORK: identity check + unicast peers from the fleet MAC table
+// =====================================================================
+void checkOwnMac() {
+  // Read the MAC straight from eFuse: works even before the Wi-Fi driver has
+  // finished starting (WiFi.macAddress() returns 00:00:.. at that moment)
+  uint8_t mine[6] = {0};
+  esp_read_mac(mine, ESP_MAC_WIFI_STA);
+  Serial.print("  this board MAC : ");  printMacBytes(mine);         Serial.println();
+  Serial.print("  expected MAC   : ");  printMacBytes(macOf(ROBOT_ID)); Serial.println();
+  if (memcmp(mine, macOf(ROBOT_ID), 6) != 0)
+    Serial.println("  !!! WARNING: MAC MISMATCH - wrong sketch on this board !!!");
+}
+
+bool addFleetPeers() {
+  for (int i = 0; i < FLEET_SIZE; i++) {
+    if (FLEET[i].id == ROBOT_ID) continue;
+    esp_now_peer_info_t pi = {};
+    memcpy(pi.peer_addr, FLEET[i].mac, 6);
+    pi.channel = WIFI_CHANNEL;
+    pi.encrypt = false;
+    if (esp_now_add_peer(&pi) != ESP_OK) return false;
+    Serial.print("  peer added     : ");  printMacBytes(FLEET[i].mac);
+    Serial.printf("  (%s)\n", FLEET[i].name);
+  }
+  return true;
+}
+
+bool packetTrusted(const RxItem& it, char claimed) {
+  char id = idFromMac(it.mac);
+  if (id != 0 && id == claimed) return true;
+  if (++droppedUnknown <= 5) {
+    Serial.print("[NET] dropped packet from untrusted MAC ");  printMacBytes(it.mac);  Serial.println();
+  }
+  return false;
+}
+
+// =====================================================================
+// RECEIVE
+// =====================================================================
+void onControl(const ControlMsg& m) {
+  int r = ROBOT_ID - 'A';
+  if (m.running != running) {
+    running = m.running;
+    Serial.printf("[%c] %s received from ESP-C\n", ROBOT_ID, running ? "GO" : "STOP");
+  }
+  if (m.resetId[r] != resetId) applyReset(m.resetId[r], m.rx[r], m.ry[r]);
+  if (m.jobId[r] != jobId) {
+    uint8_t g = (m.gx[r] == NONE) ? NONE : cellIdx(m.gx[r], m.gy[r]);
+    newGoal(g, m.jobId[r]);
+  }
+}
+
+void onPeerState(const StateMsg& s) {
+  bool newPlan = !peer.valid || peer.s.planVer != s.planVer;
+  peer.s = s;
+  peer.valid = true;
+  peer.lastSeen = millis();
+  if (newPlan) {
+    Serial.printf("[%c] <- Robot %c shared plan v%u: ", ROBOT_ID, s.h.sender, s.planVer);
+    printPath("", cellIdx(s.x, s.y), s.plan, s.planLen);
+  }
+}
+
+void handlePacket(const RxItem& it) {
+  if (!validHeader(it.data, it.len)) return;
+  MsgHeader h;
+  memcpy(&h, it.data, sizeof(h));
+  if (!packetTrusted(it, h.sender)) return;
+
+  if (h.type == MSG_STATE && h.sender == PEER_ID && it.len == sizeof(StateMsg)) {
+    StateMsg s;  memcpy(&s, it.data, sizeof(s));  onPeerState(s);
+  } else if (h.type == MSG_CONTROL && h.sender == 'C' && it.len == sizeof(ControlMsg)) {
+    ControlMsg m;  memcpy(&m, it.data, sizeof(m));  onControl(m);
+  }
+}
+
+void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len <= 0 || len > 250) return;
+  RxItem it;
+  memcpy(it.mac, info->src_addr, 6);
+  it.len = len;
+  memcpy(it.data, data, len);
+  xQueueSend(rxQueue, &it, 0);
+}
+
+// =====================================================================
+// SETUP / LOOP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(800);
+  WiFi.mode(WIFI_STA);
+  WiFi.setChannel(WIFI_CHANNEL);
+  nonce = esp_random();
+  rxQueue = xQueueCreate(16, sizeof(RxItem));
+  memset(&peer, 0, sizeof(peer));
+  pos = cellIdx(START_X, START_Y);
+
+  Serial.println();
+  Serial.println("==============================================");
+  Serial.printf ("  AUTONAV v4 - ROBOT %c   start (%u,%u)\n", ROBOT_ID, START_X, START_Y);
+  checkOwnMac();
+
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW INIT FAILED"); while (true) delay(1000); }
+  esp_now_register_recv_cb(onDataRecv);
+  if (!addFleetPeers()) { Serial.println("PEER SETUP FAILED"); while (true) delay(1000); }
+  Serial.println("==============================================");
+  Serial.println("Waiting for a job from ESP-C...");
+  broadcastState();
+}
+
+void loop() {
+  RxItem it;
+  while (xQueueReceive(rxQueue, &it, 0) == pdTRUE) handlePacket(it);
+
+  coordinate();
+
+  if (millis() - lastState >= STATE_PERIOD_MS) broadcastState();
+  delay(10);
+}
